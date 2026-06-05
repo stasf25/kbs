@@ -1,0 +1,28 @@
+# Development
+dotenv==0.9.9
+numpy==1.26.4
+pipdeptree==2.16.1
+jupyterlab==4.4.3
+ipywidgets==8.1.1
+
+# Web & Async
+fastapi==0.136.3
+uvicorn[standard]==0.48.0
+python-multipart==0.0.29
+
+# Vector DB & Embedding
+qdrant-client==1.18.0
+openai==2.7.1
+
+# Parsing & Chunking
+kreuzberg==4.9.9
+langchain==1.1.0
+langchain-classic==1.0.0
+langchain-community==0.4.1
+langchain-kreuzberg==1.0.2
+langchain-openai==1.1.0
+
+# Auth & Metrics
+pyjwt==2.13.0
+prometheus-fastapi-instrumentator==8.0.0
+prometheus_client==0.22.1

@@ -1,0 +1,13 @@
+apiVersion: 1
+providers:
+  - name: 'kbs-dashboards'
+    orgId: 1
+    folder: 'KBS Monitoring'
+    type: file
+    disableDeletion: false
+    editable: true
+    updateIntervalSeconds: 10
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards
+      foldersFromFilesStructure: false

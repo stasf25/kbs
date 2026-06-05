@@ -1,0 +1,17 @@
+sudo apt-get update
+sudo apt-get install python3.10-venv
+python3.10 -m venv .venv
+echo "*" >.venv/.gitignore
+source venv
+pwd
+read -n 1 -p "Continue (y/n)? " answer
+case ${answer:0:1} in
+    y|Y )
+        pip install pip==25.2
+        pip install -r requirements.txt
+        #source torch_inst
+    ;;
+    * )
+        echo not executed: pip install -r requirements.txt
+    ;;
+esac
