@@ -1,0 +1,32 @@
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  filename: /var/lib/promtail/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: kbs
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: kbs
+          container: kbs
+    pipeline_stages:
+      - docker: {}
+      - json:
+          expressions:
+            level: level
+            request_id: request_id
+            tenant_id: tenant_id
+            endpoint: endpoint
+            msg: msg
+      - labels:
+          level: ""
+          tenant_id: ""
+          endpoint: ""
+          request_id: ""

@@ -1,6 +1,7 @@
 # Development
-dotenv==0.9.9
+python-dotenv==1.2.2
 numpy==1.26.4
+httpx==0.28.1
 pipdeptree==2.16.1
 jupyterlab==4.4.3
 ipywidgets==8.1.1

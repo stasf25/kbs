@@ -2,16 +2,23 @@ version: '3.8'
 
 services:
   kbs:
-    build: .
+    build:
+      context: ./service
+      dockerfile: Dockerfile
     container_name: kbs
     ports:
       - "8000:8000"
     environment:
-      - QDRANT_URL=http://qdrant:6333
-      - QDRANT_API_KEY=${QDRANT_API_KEY:-}
-      - EMBEDDING_API_KEY=${EMBEDDING_API_KEY}
-      - JWT_SECRET=${JWT_SECRET}
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - KBS_QDRANT_URL=http://qdrant:6333
+      - KBS_QDRANT_API_KEY=${QDRANT_API_KEY}
+      - KBS_DEFAULT_API_KEY=${EMBEDDING_API_KEY}
+      - KBS_JWT_SECRET=${JWT_SECRET}
+      - KBS_LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - KBS_DEFAULT_QUOTA_KB=${DEFAULT_QUOTA_KB:-16384}
+      - KBS_COLLECTION_PREFIX=${COLLECTION_PREFIX:-emb_}
+      - KBS_UVICORN_TIMEOUT_KEEP_ALIVE=600
+      - KBS_LEGACY_QUERY_URL=${LEGACY_QUERY_URL:-}
+      - KBS_LEGACY_PROXY_TIMEOUT=${LEGACY_PROXY_TIMEOUT:-30.0}
     depends_on:
       qdrant:
         condition: service_healthy
@@ -33,7 +40,7 @@ services:
       - "6333:6333"
       - "6334:6334"
     environment:
-      - QDRANT__SERVICE__API_KEY=${QDRANT_API_KEY:-}
+      - QDRANT__SERVICE__API_KEY=${QDRANT_API_KEY}
     volumes:
       - qdrant_storage:/qdrant/storage
       - ./qdrant/config/config.yaml:/qdrant/config/config.yaml:ro
@@ -57,8 +64,6 @@ services:
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
-      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
-      - '--web.console.templates=/usr/share/prometheus/consoles'
     restart: unless-stopped
     networks:
       - kbs_net
@@ -71,13 +76,39 @@ services:
     environment:
       - GF_SECURITY_ADMIN_USER=${GRAFANA_USER:-admin}
       - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
-      - GF_SERVER_ROOT_URL=http://localhost:3000
     volumes:
       - grafana_data:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning
     depends_on:
-      prometheus:
-        condition: service_started
+      - prometheus
+      - loki
+    restart: unless-stopped
+    networks:
+      - kbs_net
+
+  loki:
+    image: grafana/loki:latest
+    container_name: loki
+    ports:
+      - "3100:3100"
+    volumes:
+      - loki_data:/loki
+    command: -config.file=/etc/loki/local-config.yaml
+    restart: unless-stopped
+    networks:
+      - kbs_net
+
+  promtail:
+    image: grafana/promtail:latest
+    container_name: promtail
+    volumes:
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./promtail/promtail-config.yml:/etc/promtail/config.yml:ro
+      - promtail_positions:/var/lib/promtail
+    command: -config.file=/etc/promtail/config.yml
+    depends_on:
+      - loki
     restart: unless-stopped
     networks:
       - kbs_net
@@ -86,6 +117,8 @@ volumes:
   qdrant_storage:
   prometheus_data:
   grafana_data:
+  loki_data:
+  promtail_positions:
 
 networks:
   kbs_net:

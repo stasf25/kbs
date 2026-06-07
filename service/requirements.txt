@@ -1,3 +1,8 @@
+# General purpose
+python-dotenv==1.2.2
+numpy==1.26.4
+httpx==0.28.1
+
 # Web & Async
 fastapi==0.136.3
 uvicorn[standard]==0.48.0

@@ -1,91 +1,146 @@
 {
-  "annotations": { "list": [{ "builtIn": 1, "datasource": "-- Grafana --", "enable": true, "hide": true, "iconColor": "rgba(0,211,255,1)", "name": "Annotations & Alerts", "type": "dashboard" }] },
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
   "editable": true,
   "fiscalYearStartMonth": 0,
-  "graphTooltip": 1,
+  "graphTooltip": 0,
   "id": null,
   "links": [],
   "liveNow": false,
   "panels": [
+    { "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }, "id": 1, "panels": [], "title": "📊 Overview", "type": "row" },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "fillOpacity": 80, "gradientMode": "none", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "auto", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] } }, "overrides": [] },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
-      "id": 1,
-      "options": { "legend": { "calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "single", "sort": "none" } },
-      "targets": [{ "datasource": { "type": "prometheus", "uid": "prometheus" }, "editorMode": "code", "expr": "sum(rate(kbs_requests_total[5m])) by (status, endpoint)", "legendFormat": "{{status}} {{endpoint}}", "range": true, "refId": "A" }],
-      "title": "Request Rate (RPS)",
-      "type": "timeseries"
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 80 }] }, "unit": "reqps" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 1 }, "id": 2,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(rate(kbs_requests_total{endpoint=~\"$endpoint\"}[5m])) by (endpoint, status)", "legendFormat": "{{endpoint}} {{status}}", "refId": "A" }],
+      "title": "Request Rate (by endpoint & status)", "type": "timeseries",
+      "dataLinks": [
+        { "title": "🔍 Explore Logs (Loki)", "url": "/explore?left=%7B%22datasource%22%3A%22loki%22%2C%22queries%22%3A%5B%7B%22refId%22%3A%22A%22%2C%22expr%22%3A%22%7Bcontainer%3D%5C%22kbs%5C%22%7D%20%7C%20json%20%7C%20endpoint%3D%5C%22%24%7B__field.labels.endpoint%7D%5C%22%22%7D%5D%2C%22range%22%3A%7B%22from%22%3A%22%24%7B__from%7D%22%2C%22to%22%3A%22%24%7B__to%7D%22%7D%7D", "targetBlank": true }
+      ]
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "s", "axisPlacement": "auto", "fillOpacity": 80, "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "auto", "spanNulls": false, "stacking": { "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }, "unit": "s" }, "overrides": [] },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
-      "id": 2,
-      "options": { "legend": { "calcs": ["p95"], "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "single", "sort": "none" } },
-      "targets": [{ "datasource": { "type": "prometheus", "uid": "prometheus" }, "editorMode": "code", "expr": "histogram_quantile(0.95, sum(rate(kbs_embed_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p95 /embed", "range": true, "refId": "A" }, { "datasource": { "type": "prometheus", "uid": "prometheus" }, "editorMode": "code", "expr": "histogram_quantile(0.95, sum(rate(kbs_query_duration_seconds_bucket[5m])) by (le))", "hide": false, "legendFormat": "p95 /query ({{model_key}})", "range": true, "refId": "B" }],
-      "title": "p95 Latency",
-      "type": "timeseries"
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] }, "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 1 }, "id": 3,
+      "options": { "legend": { "calcs": ["p95", "p99"], "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.95, sum(rate(kbs_embed_duration_seconds_bucket[5m])) by (le))", "legendFormat": "embed p95", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.95, sum(rate(kbs_query_duration_seconds_bucket{model_key=~\"$model_key\"}[5m])) by (le, model_key))", "hide": false, "legendFormat": "query p95 {{model_key}}", "refId": "B" }
+      ],
+      "title": "Latency (p95)", "type": "timeseries",
+      "dataLinks": [
+        { "title": "🔍 Explore Logs (Loki)", "url": "/explore?left=%7B%22datasource%22%3A%22loki%22%2C%22queries%22%3A%5B%7B%22refId%22%3A%22A%22%2C%22expr%22%3A%22%7Bcontainer%3D%5C%22kbs%5C%22%7D%20%7C%20json%20%7C%20endpoint%3D%5C%22%24%7B__field.labels.endpoint%7D%5C%22%22%7D%5D%2C%22range%22%3A%7B%22from%22%3A%22%24%7B__from%7D%22%2C%22to%22%3A%22%24%7B__to%7D%22%7D%7D", "targetBlank": true }
+      ]
+    },
+    { "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 }, "id": 4, "panels": [], "title": "🎯 Score Distribution & Calibration", "type": "row" },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "bars", "fillOpacity": 80, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 80 }] }, "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 10 }, "id": 5,
+      "options": { "legend": { "calcs": [], "displayMode": "list", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(rate(kbs_score_distribution_bucket{model_key=~\"$model_key\"}[5m])) by (le, model_key)", "format": "heatmap", "legendFormat": "{{model_key}}", "refId": "A" }],
+      "title": "Score Distribution Heatmap (calibrated)", "type": "timeseries",
+      "dataLinks": [
+        { "title": "🔍 Explore Logs (Loki)", "url": "/explore?left=%7B%22datasource%22%3A%22loki%22%2C%22queries%22%3A%5B%7B%22refId%22%3A%22A%22%2C%22expr%22%3A%22%7Bcontainer%3D%5C%22kbs%5C%22%7D%20%7C%20json%20%7C%20model_key%3D%5C%22%24%7B__field.labels.model_key%7D%5C%22%22%7D%5D%2C%22range%22%3A%7B%22from%22%3A%22%24%7B__from%7D%22%2C%22to%22%3A%22%24%7B__to%7D%22%7D%7D", "targetBlank": true }
+      ]
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "fillOpacity": 80, "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "auto", "spanNulls": false, "stacking": { "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }, "unit": "short" }, "overrides": [] },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
-      "id": 3,
-      "options": { "legend": { "calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "single", "sort": "none" } },
-      "targets": [{ "datasource": { "type": "prometheus", "uid": "prometheus" }, "editorMode": "code", "expr": "sum(rate(kbs_score_distribution_bucket[5m])) by (le, model_key)", "legendFormat": "{{model_key}} ≤ {{le}}", "range": true, "refId": "A" }],
-      "title": "Score Distribution (Cumulative)",
-      "type": "timeseries"
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 0.01 }, { "color": "red", "value": 0.05 }] }, "unit": "percentunit" }, "overrides": [] },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 10 }, "id": 6,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(rate(kbs_calibration_out_of_range_total{model_key=~\"$model_key\"}[5m])) by (model_key) / sum(rate(kbs_score_distribution_count{model_key=~\"$model_key\"}[5m])) by (model_key)", "legendFormat": "{{model_key}}", "refId": "A" }],
+      "title": "Out-of-Range Ratio (calibration health)", "type": "stat"
+    },
+    { "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 19 }, "id": 7, "panels": [], "title": "📉 Drift Monitoring", "type": "row" },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "line+area" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 0.1 }, { "color": "red", "value": 0.2 }] }, "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 }, "id": 8,
+      "options": { "legend": { "calcs": ["last", "mean", "max"], "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "kbs_drift_psi{model_key=~\"$model_key\"}", "legendFormat": "{{model_key}}", "refId": "A" }],
+      "title": "Population Stability Index (PSI) — Drift Alert", "type": "timeseries",
+      "dataLinks": [
+        { "title": "🔍 Explore Logs (Loki)", "url": "/explore?left=%7B%22datasource%22%3A%22loki%22%2C%22queries%22%3A%5B%7B%22refId%22%3A%22A%22%2C%22expr%22%3A%22%7Bcontainer%3D%5C%22kbs%5C%22%7D%20%7C%20json%20%7C%20model_key%3D%5C%22%24%7B__field.labels.model_key%7D%5C%22%22%7D%5D%2C%22range%22%3A%7B%22from%22%3A%22%24%7B__from%7D%22%2C%22to%22%3A%22%24%7B__to%7D%22%7D%7D", "targetBlank": true }
+      ]
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 0.05 }, { "color": "red", "value": 0.1 }] }, "unit": "short" }, "overrides": [] },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
-      "id": 4,
-      "options": { "colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
-      "targets": [{ "datasource": { "type": "prometheus", "uid": "prometheus" }, "editorMode": "code", "expr": "kbs_ece_per_model", "legendFormat": "{{model_key}}", "range": true, "refId": "A" }],
-      "title": "Expected Calibration Error (ECE)",
-      "type": "stat"
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 80 }] }, "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 }, "id": 9,
+      "options": { "legend": { "calcs": ["mean", "last"], "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "kbs_score_mean{model_key=~\"$model_key\"}", "legendFormat": "{{model_key}} mean", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "kbs_score_out_of_range_ratio{model_key=~\"$model_key\"}", "hide": false, "legendFormat": "{{model_key}} OOR ratio", "refId": "B" }
+      ],
+      "title": "Score Mean & Out-of-Range Ratio", "type": "timeseries",
+      "dataLinks": [
+        { "title": "🔍 Explore Logs (Loki)", "url": "/explore?left=%7B%22datasource%22%3A%22loki%22%2C%22queries%22%3A%5B%7B%22refId%22%3A%22A%22%2C%22expr%22%3A%22%7Bcontainer%3D%5C%22kbs%5C%22%7D%20%7C%20json%20%7C%20model_key%3D%5C%22%24%7B__field.labels.model_key%7D%5C%22%22%7D%5D%2C%22range%22%3A%7B%22from%22%3A%22%24%7B__from%7D%22%2C%22to%22%3A%22%24%7B__to%7D%22%7D%7D", "targetBlank": true }
+      ]
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 0 }] } }, "overrides": [] },
-      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 16 },
-      "id": 5,
-      "options": { "colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
-      "targets": [{ "datasource": { "type": "prometheus", "uid": "prometheus" }, "editorMode": "code", "expr": "up{job=\"kbs\"}", "legendFormat": "{{job}}", "range": true, "refId": "A" }],
-      "title": "KBS Status",
-      "type": "stat"
+      "description": "Сводная таблица по всем моделям",
+      "fieldConfig": { "defaults": { "custom": { "align": "auto", "cellOptions": { "type": "auto" }, "filterable": true, "inspect": false }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 80 }] } }, "overrides": [
+        { "matcher": { "id": "byName", "options": "PSI" }, "properties": [{ "id": "custom.cellOptions", "value": { "mode": "gradient", "type": "gauge" } }, { "id": "max", "value": 0.3 }] },
+        { "matcher": { "id": "byName", "options": "OOR Ratio" }, "properties": [{ "id": "unit", "value": "percentunit" }, { "id": "thresholds", "value": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 0.05 }, { "color": "red", "value": 0.1 }] } }] }
+      ]},
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 28 }, "id": 10,
+      "options": { "footer": { "fields": "", "reducer": ["sum"], "show": false }, "showHeader": true, "sortBy": [{ "desc": true, "displayName": "PSI" }] },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "kbs_drift_psi", "format": "table", "instant": true, "refId": "PSI" },
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "kbs_score_mean", "format": "table", "hide": false, "instant": true, "refId": "MEAN" },
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "kbs_score_out_of_range_ratio", "format": "table", "hide": false, "instant": true, "refId": "OOR" }
+      ],
+      "title": "Model Health Summary",
+      "transformations": [
+        { "id": "merge", "options": {} },
+        { "id": "organize", "options": { "excludeByName": { "Time": true }, "indexByName": { "Time": 0, "Value #PSI": 3, "Value #MEAN": 4, "Value #OOR": 5, "model_key": 1 }, "renameByName": { "Value #PSI": "PSI", "Value #MEAN": "Score Mean", "Value #OOR": "OOR Ratio", "model_key": "Model" } } }
+      ],
+      "type": "table"
     },
+    { "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 36 }, "id": 11, "panels": [], "title": "📜 Application Logs (Loki)", "type": "row" },
     {
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 0 }] } }, "overrides": [] },
-      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 16 },
-      "id": 6,
-      "options": { "colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
-      "targets": [{ "datasource": { "type": "prometheus", "uid": "prometheus" }, "editorMode": "code", "expr": "up{job=\"qdrant\"}", "legendFormat": "{{job}}", "range": true, "refId": "A" }],
-      "title": "Qdrant Status",
-      "type": "stat"
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "fillOpacity": 80, "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "auto", "spanNulls": false, "stacking": { "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] } }, "overrides": [] },
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 16 },
-      "id": 7,
-      "options": { "legend": { "calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "single", "sort": "none" } },
-      "targets": [{ "datasource": { "type": "prometheus", "uid": "prometheus" }, "editorMode": "code", "expr": "sum(qdrant_collections_count)", "legendFormat": "Collections", "range": true, "refId": "A" }, { "datasource": { "type": "prometheus", "uid": "prometheus" }, "editorMode": "code", "expr": "sum(qdrant_points_count_total)", "hide": false, "legendFormat": "Points", "range": true, "refId": "B" }],
-      "title": "Qdrant Collections & Points",
-      "type": "timeseries"
+      "datasource": { "type": "loki", "uid": "loki" },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 37 }, "id": 12,
+      "options": { "dedupStrategy": "none", "enableLogDetails": true, "prettifyLogMessage": false, "showCommonLabels": false, "showLabels": false, "showTime": true, "sortOrder": "Descending", "wrapLogMessage": false },
+      "targets": [
+        { "datasource": { "type": "loki", "uid": "loki" }, "editorMode": "code", "expr": "{container=\"kbs\"} | json | level=~\"$log_level\" | tenant_id=~\"$tenant_id\" | request_id=~\"$request_id\" | endpoint=~\"$endpoint\" | line_format `{{.request_id}} [{{.level}}] {{.endpoint}} {{.msg}}`", "queryType": "range", "refId": "A" }
+      ],
+      "title": "Structured Logs (filter by level, tenant, endpoint, request_id)", "type": "logs"
     }
   ],
+  "refresh": "30s",
   "schemaVersion": 38,
   "style": "dark",
-  "tags": ["kbs", "rag", "qdrant", "monitoring"],
-  "templating": { "list": [] },
+  "tags": ["kbs", "vector-search", "calibration"],
+  "templating": {
+    "list": [
+      { "current": { "selected": true, "text": "All", "value": "$__all" }, "datasource": { "type": "prometheus", "uid": "prometheus" }, "definition": "label_values(kbs_score_distribution, model_key)", "hide": 0, "includeAll": true, "label": "Model", "multi": true, "name": "model_key", "query": { "query": "label_values(kbs_score_distribution, model_key)", "refId": "Prometheus-model_key-Variable-Query" }, "refresh": 2, "regex": "", "skipUrlSync": false, "sort": 1, "type": "query" },
+      { "current": { "selected": true, "text": "All", "value": "$__all" }, "datasource": { "type": "prometheus", "uid": "prometheus" }, "definition": "label_values(kbs_requests_total, endpoint)", "hide": 0, "includeAll": true, "label": "Endpoint", "multi": true, "name": "endpoint", "query": { "query": "label_values(kbs_requests_total, endpoint)", "refId": "Prometheus-endpoint-Variable-Query" }, "refresh": 2, "regex": "", "skipUrlSync": false, "sort": 1, "type": "query" },
+      { "current": { "selected": true, "text": "All", "value": "$__all" }, "hide": 0, "includeAll": true, "label": "Log Level", "multi": true, "name": "log_level", "options": [{ "selected": true, "text": "All", "value": "$__all" }, { "selected": false, "text": "INFO", "value": "INFO" }, { "selected": false, "text": "WARNING", "value": "WARNING" }, { "selected": false, "text": "ERROR", "value": "ERROR" }], "query": "INFO,WARNING,ERROR", "refresh": 0, "skipUrlSync": false, "type": "custom" },
+      { "current": { "selected": false, "text": "", "value": "" }, "hide": 0, "includeAll": false, "label": "Tenant ID", "multi": false, "name": "tenant_id", "query": "", "skipUrlSync": false, "type": "textbox" },
+      { "current": { "selected": false, "text": "", "value": "" }, "hide": 0, "includeAll": false, "label": "Request ID", "multi": false, "name": "request_id", "query": "", "skipUrlSync": false, "type": "textbox" }
+    ]
+  },
   "time": { "from": "now-6h", "to": "now" },
-  "timepicker": {},
+  "timepicker": { "refresh_intervals": ["5s", "10s", "30s", "1m", "5m", "15m", "30m", "1h", "2h", "1d"] },
   "timezone": "",
-  "title": "KBS & Qdrant Monitoring",
-  "version": 1,
+  "title": "Knowledge Base Service (KBS) — Production Dashboard",
+  "uid": "kbs-production-v1",
+  "version": 2,
   "weekStart": ""
 }
