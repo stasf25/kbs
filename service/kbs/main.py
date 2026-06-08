@@ -231,82 +231,6 @@ def cascade_chunk_markdown(
     ]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 🧠 Middleware для сквозного логирования (ТЗ 7.3)
-# ─────────────────────────────────────────────────────────────────────────────
-class RequestContextMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        req_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
-        request_id_var.set(req_id)
-        endpoint_var.set(f"{request.method} {request.url.path}")
-        response = await call_next(request)
-        response.headers["X-Request-ID"] = req_id
-        return response
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 🧠 Middleware для проксирования запросов на legacy endpoint
-# ─────────────────────────────────────────────────────────────────────────────
-class LegacyProxyMiddleware(BaseHTTPMiddleware):
-    """
-    Проксирует запросы к старым БЗ на legacy-эндпоинт.
-    Если base_id найден в kb_metadata → обработка в новом сервисе.
-    Если base_id отсутствует → запрос проксируется на legacy_url.
-    """
-    def __init__(self, app, legacy_url: str, timeout: float = 30.0):
-        super().__init__(app)
-        self.legacy_url = legacy_url
-        self.timeout = timeout
-
-    async def dispatch(self, request: Request, call_next):
-        # Работаем только с POST /api/v1/kb/query и если legacy_url задан
-        if request.method != "POST" or request.url.path != "/api/v1/kb/query":
-            return await call_next(request)
-        
-        settings = request.app.state.settings
-        if not settings.legacy_query_url:
-            return await call_next(request)
-
-        # Читаем body один раз
-        body_bytes = await request.body()
-        
-        try:
-            payload = json.loads(body_bytes)
-            target_id = payload.get("base_id") or (payload.get("base_ids") or [None])[0]
-            
-            if target_id:
-                # O(1) проверка существования base_id в мета-коллекции
-                backend = request.app.state.kbs.backend
-                found = await backend.retrieve(
-                    collection_name=settings.meta_collection_name, 
-                    ids=[target_id]
-                )
-                if not found:
-                    # Базы нет в Qdrant → проксируем на legacy
-                    return await self._proxy_to_legacy(request, body_bytes)
-        except Exception:
-            pass  # Fail-open: при любой ошибке идём в новый сервис
-
-        # Восстанавливаем body для call_next()
-        async def receive():
-            return {"type": "http.request", "body": body_bytes}
-        request._receive = receive
-        
-        return await call_next(request)
-
-    async def _proxy_to_legacy(self, request: Request, body: bytes):
-        """Прямой прокси-запрос с сохранением заголовков"""
-        headers = {k: v for k, v in request.headers.items() 
-                   if k.lower() not in ("host", "content-length", "transfer-encoding")}
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.post(self.legacy_url, content=body, headers=headers)
-        return StarletteResponse(
-            content=resp.content,
-            status_code=resp.status_code,
-            headers=dict(resp.headers)
-        )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # 🧠 Stateless Service Class (DI + Lifecycle)
 # ─────────────────────────────────────────────────────────────────────────────
 class KBSService:
@@ -807,17 +731,67 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Knowledge Base Service", version="1.0.0", lifespan=lifespan)
 app.state.settings = KBSettings.from_env()
 
-# Регистрация middleware для проксирования
-if app.state.settings.legacy_query_url:
-    app.add_middleware(
-        LegacyProxyMiddleware,
-        legacy_url=app.state.settings.legacy_query_url,
-        timeout=app.state.settings.legacy_proxy_timeout
-    )
+# ─────────────────────────────────────────────────────────────────────────────
+# 🧠 Middleware для сквозного логирования (ТЗ 7.3)
+# ─────────────────────────────────────────────────────────────────────────────
+@app.middleware("http")
+async def request_context_middleware(request: Request, call_next):
+    req_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
+    request_id_var.set(req_id)
+    endpoint_var.set(f"{request.method} {request.url.path}")
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = req_id
+    return response
 
-# Регистрация middleware для сквозного логирования
-app.add_middleware(RequestContextMiddleware)
+# ─────────────────────────────────────────────────────────────────────────────
+# 🧠 Middleware для проксирования запросов на legacy endpoint
+# ─────────────────────────────────────────────────────────────────────────────
+@app.middleware("http")
+async def legacy_proxy_middleware(request: Request, call_next):
+    """
+    Проксирует запросы к старым БЗ на legacy-эндпоинт.
+    Если base_id найден в kb_metadata → обработка в новом сервисе.
+    Если base_id отсутствует → запрос проксируется на legacy_url.
+    """
+    settings = request.app.state.settings
 
+    # Работаем только с POST /api/v1/kb/query и если legacy_url задан
+    if request.method != "POST" or request.url.path != "/api/v1/kb/query" or not settings.legacy_query_url:
+        return await call_next(request)
+
+    body_bytes = await request.body()
+
+    try:
+        payload = json.loads(body_bytes)
+        target_id = payload.get("base_id") or (payload.get("base_ids") or [None])[0]
+
+        if target_id:
+            backend = request.app.state.kbs.backend
+            found = await backend.retrieve(
+                collection_name=settings.meta_collection_name,
+                ids=[target_id]
+            )
+            if not found:
+                # Базы нет в Qdrant → проксируем на legacy
+                headers = {k: v for k, v in request.headers.items()
+                           if k.lower() not in ("host", "content-length", "transfer-encoding")}
+                async with httpx.AsyncClient(timeout=settings.legacy_proxy_timeout) as client:
+                    resp = await client.post(settings.legacy_query_url, content=body_bytes, headers=headers)
+                return Response(content=resp.content, status_code=resp.status_code, headers=dict(resp.headers))
+    except Exception:
+        pass  # Fail-open: при любой ошибке идём в новый сервис
+
+    # Восстанавливаем body для call_next() (стандартный паттерн Starlette)
+    async def receive():
+        return {"type": "http.request", "body": body_bytes}
+    request._receive = receive
+    return await call_next(request)
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Эндпоинты микросервиса
+# ─────────────────────────────────────────────────────────────────────────────
 @app.get("/api/v1/kb/health", response_model=HealthResponse)
 async def health_check(kbs: KBSService = Depends(get_kbs)):
     return await kbs.health()
@@ -854,7 +828,7 @@ async def prometheus_metrics():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="1.0.0.127", port=8000, 
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, 
                 timeout_keep_alive=app.state.settings.uvicorn_timeout_keep_alive, 
                 log_level=app.state.settings.log_level.lower()
     )
