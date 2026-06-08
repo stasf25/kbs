@@ -23,8 +23,8 @@ from collections import defaultdict, deque
 from pathlib import Path
 
 from fastapi import FastAPI, Depends, Header, HTTPException, Request, BackgroundTasks
-from pydantic import BaseModel, Field, SettingsConfigDict
-from pydantic_settings import BaseSettings
+from pydantic import BaseModel, Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from dotenv import find_dotenv
 from qdrant_client import AsyncQdrantClient, models
 from openai import AsyncOpenAI
@@ -54,7 +54,8 @@ class KBSettings(BaseSettings):
 
     default_embedder_url: str = "https://api.openai.com/v1"
     default_embedder_model: str = "text-embedding-3-small"
-    default_embedder_dim: int = 1536
+    default_embedder_dim: Optional[int] = 0
+    #default_embedder_dim: int = 1536
     #default_embedder_url: str = "https://openrouter.ai/api/v1/embeddings"
     #default_embedder_model: str = "baai/bge-m3"
     #default_embedder_dim: int = 1024
@@ -106,8 +107,10 @@ logging.basicConfig(
     level=os.getenv("KBS_LOG_LEVEL", "INFO").upper(),
     format='{"timestamp":"%(asctime)s","level":"%(levelname)s","service":"kbs","request_id":"%(request_id)s","tenant_id":"%(tenant_id)s","endpoint":"%(endpoint)s","msg":"%(message)s"}'
 )
+# Применяем фильтр ко всем существующим и будущим хендлерам
+for handler in logging.root.handlers:
+    handler.addFilter(ContextLogFilter())
 logger = logging.getLogger("kbs")
-logging.getLogger().addFilter(ContextLogFilter())
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 📊 Prometheus Metrics
@@ -771,7 +774,7 @@ async def lifespan(app: FastAPI):
         url=settings.qdrant_url, api_key=settings.qdrant_api_key, prefer_grpc=True
     )
     meta_cfg = models.HnswConfigDiff(
-        m=1, payload_m=16, on_disk=True, memmap_threshold=1, full_scan_threshold=1
+        m=1, payload_m=16, on_disk=True, full_scan_threshold=1
     )
     for name in [settings.meta_collection_name, settings.models_collection_name]:
         try:

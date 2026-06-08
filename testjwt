@@ -1,0 +1,10 @@
+python -c "
+import jwt, datetime
+token = jwt.encode({
+    'sub': 'test-user',
+    'tenant_id': 'tenant-abc-123',
+    'tenant_quota_kb': 16384,
+    'exp': datetime.datetime.utcnow() + datetime.timedelta(days=365)
+}, 'dev-secret-for-local-testing-only', algorithm='HS256')
+print(token)
+"
