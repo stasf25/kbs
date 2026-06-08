@@ -66,7 +66,7 @@ class KBSettings(BaseSettings):
 
     default_tokens_price: float = 0.02   # for 1M tokens
     #pricing: Dict[str, float] = {"text-embedding-3-small": 0.02, "bge-m3": 0.01}
-
+    embed_max_batch_kb: int = 64
     default_chunk_size: int = 500
     default_chunk_overlap: int = 80
     default_separator: str = "--- BLOCK START ---"
@@ -332,7 +332,13 @@ class KBSService:
 
     async def _get_model_calibration(self, model_key: str) -> Optional[Dict[str, float]]:
         try:
-            points = await self.backend.retrieve(collection_name=self._models_collection, ids=[model_key], with_payload=["c_min", "c_max", "is_calibrated"])
+            points, _ = await self.backend.scroll(
+                collection_name=self._models_collection,
+                scroll_filter=models.Filter(must=[
+                    models.FieldCondition(key="model_name", match=models.MatchValue(value=model_key))
+                ]),
+                limit=1, with_payload=["c_min", "c_max", "is_calibrated"], with_vectors=False
+            )
             if points and points[0].payload.get("is_calibrated"):
                 return {"min": points[0].payload["c_min"], "max": points[0].payload["c_max"]}
         except Exception: pass
@@ -365,19 +371,25 @@ class KBSService:
 
             if model_key not in self._baselines:
                 try:
-                    pts = await self.backend.retrieve(collection_name=self._models_collection, ids=[model_key], with_payload=["baseline_hist"])
+                    pts, _ = await self.backend.scroll(
+                        collection_name=self._models_collection,
+                        scroll_filter=models.Filter(must=[
+                            models.FieldCondition(
+                                key="model_name", match=models.MatchValue(value=model_key)
+                            )
+                        ]),
+                        limit=1, with_payload=["baseline_hist"], with_vectors=False
+                    )
                     if pts and pts[0].payload.get("baseline_hist"):
                         self._baselines[model_key] = np.array(pts[0].payload["baseline_hist"], dtype=np.float32)
                 except Exception: pass
 
             if self._baselines.get(model_key) is None and len(window) >= 1000:
                 hist, _ = np.histogram(list(window), bins=self._bucket_edges, density=False)
-                await self.backend.upsert(
-                    collection_name=self._models_collection, 
-                    points=[models.PointStruct(
-                        id=model_key, vector=[0.0], 
-                        payload={"baseline_hist": [float(x) for x in hist]}
-                    )]
+                await self.backend.set_payload(
+                    collection_name=self._models_collection,
+                    payload={"baseline_hist": [float(x) for x in hist]},
+                    points=[model_key]
                 )
                 self._baselines[model_key] = hist.astype(np.float32)
 
@@ -420,9 +432,12 @@ class KBSService:
 
     async def _auto_calibrate_if_new(self, model_key: str, vectors: List[List[float]]):
         try:
-            pts = await self.backend.retrieve(
-                collection_name=self._models_collection, ids=[model_key], 
-                with_payload=["is_calibrated"]
+            pts, _ = await self.backend.scroll(
+                collection_name=self._models_collection,
+                scroll_filter=models.Filter(must=[
+                    models.FieldCondition(key="model_name", match=models.MatchValue(value=model_key))
+                ]),
+                limit=1, with_payload=["is_calibrated"], with_vectors=False
             )
             if pts and pts[0].payload.get("is_calibrated"): return
         except Exception: pass
@@ -443,15 +458,18 @@ class KBSService:
             return round(c_min, 4), round(c_max, 4)
 
         c_min, c_max = await asyncio.to_thread(_compute)
-        await self.backend.upsert(
-            collection_name=self._models_collection, 
-            points=[models.PointStruct(id=model_key, vector=[0.0], payload={
-            "c_min": c_min, "c_max": c_max, "is_calibrated": True,
-            "fitted_at": time.time(), "method": "batch_pairwise_percentiles", "sample_size": len(vectors)
-        })])
+        await self.backend.set_payload(
+            collection_name=self._models_collection,
+            payload={
+                "c_min": c_min, "c_max": c_max, "is_calibrated": True,
+                "fitted_at": time.time(), "method": "batch_pairwise_percentiles", 
+                "sample_size": len(vectors)
+            },
+            points=[model_key]
+        )
         logger.info(f"Auto-calibrated {model_key}: c_min={c_min}, c_max={c_max}")
 
-    async def _parse_to_markdown(self, req: EmbedRequest) -> tuple[List[Dict[str, Any]], Dict[str, str]]:
+    async def _parse_and_chunk(self, req: EmbedRequest) -> tuple[List[Dict[str, Any]], Dict[str, str]]:
         def _sync_process() -> tuple[List[Dict[str, Any]], Dict[str, str]]:
             all_chunks, documents_map = [], {}
             config = ExtractionConfig(output_format="markdown")
@@ -501,8 +519,14 @@ class KBSService:
 
         # 1. Логика перезаписи (если base_id уже существует в метаданных)
         if req.base_id:
-            old_pts = await self.backend.retrieve(
-                collection_name=self._meta_collection, ids=[req.base_id]
+            # Используем scroll с фильтром, т.к. base_id может быть не UUID
+            old_pts, _ = await self.backend.scroll(
+                collection_name=self._meta_collection,
+                scroll_filter=models.Filter(must=[
+                    models.FieldCondition(key="base_id", match=models.MatchValue(value=req.base_id)),
+                    models.FieldCondition(key="tenant_id", match=models.MatchValue(value=tenant_id))
+                ]),
+                limit=1, with_payload=True, with_vectors=False
             )
             if old_pts:
                 old_cfg = old_pts[0].payload
@@ -517,7 +541,7 @@ class KBSService:
                 logger.warning(f"⚠️ Explicit base_id={req.base_id} not found during /embed")
 
         # 2. Парсинг и чанкование
-        chunks, documents_map = await self._parse_to_markdown(req)
+        chunks, documents_map = await self._parse_and_chunk(req)
         if not chunks:
             raise HTTPException(400, detail="No valid chunks generated after parsing.")
 
@@ -547,7 +571,7 @@ class KBSService:
         while l < len(texts):
             current_kb = 0.0
 
-            while (r < len(texts) and current_kb < limit_kb) or (r==l):
+            while r < len(texts) and (current_kb < limit_kb or r==l):
                 current_kb += len(texts[r].encode("utf-8")) / 1024.0
                 r += 1
 
@@ -734,7 +758,7 @@ app.state.settings = KBSettings.from_env()
 # ─────────────────────────────────────────────────────────────────────────────
 # 🧠 Middleware для сквозного логирования (ТЗ 7.3)
 # ─────────────────────────────────────────────────────────────────────────────
-@app.middleware("http")
+#@app.middleware("http")
 async def request_context_middleware(request: Request, call_next):
     req_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
     request_id_var.set(req_id)
@@ -746,7 +770,7 @@ async def request_context_middleware(request: Request, call_next):
 # ─────────────────────────────────────────────────────────────────────────────
 # 🧠 Middleware для проксирования запросов на legacy endpoint
 # ─────────────────────────────────────────────────────────────────────────────
-@app.middleware("http")
+#@app.middleware("http")
 async def legacy_proxy_middleware(request: Request, call_next):
     """
     Проксирует запросы к старым БЗ на legacy-эндпоинт.
@@ -767,9 +791,12 @@ async def legacy_proxy_middleware(request: Request, call_next):
 
         if target_id:
             backend = request.app.state.kbs.backend
-            found = await backend.retrieve(
+            found, _ = await backend.scroll(
                 collection_name=settings.meta_collection_name,
-                ids=[target_id]
+                scroll_filter=models.Filter(must=[
+                    models.FieldCondition(key="base_id", match=models.MatchValue(value=target_id))
+                ]),
+                limit=1, with_payload=False, with_vectors=False
             )
             if not found:
                 # Базы нет в Qdrant → проксируем на legacy

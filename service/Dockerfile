@@ -22,5 +22,4 @@ USER kbsuser
 EXPOSE 8000
 
 # Запуск с таймаутом keep-alive 600s для долгих /embed запросов
-#CMD ["uvicorn", "kbs.main:app", "--host", "0.0.0.0", "--port", "8000", "--timeout-keep-alive", "600"]
-CMD ["uvicorn", "kbs.main:app", "--host", "127.0.0.1", "--port", "8000", "--timeout-keep-alive", "600"]
+CMD ["uvicorn", "kbs.main:app", "--host", "0.0.0.0", "--port", "8000", "--timeout-keep-alive", "600"]

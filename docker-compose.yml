@@ -5,7 +5,7 @@ services:
       dockerfile: Dockerfile
     container_name: kbs
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     environment:
       - KBS_QDRANT_URL=http://qdrant:6333
       - KBS_QDRANT_API_KEY=${QDRANT_API_KEY}
