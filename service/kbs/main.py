@@ -1,4 +1,3 @@
-# main.py
 """
 Knowledge Base Service (KBS) v1.0.0
 Микросервис управления базами знаний на FastAPI + Qdrant
@@ -21,7 +20,6 @@ from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager
 from collections import defaultdict, deque
 from pathlib import Path
-
 from fastapi import FastAPI, Depends, Header, HTTPException, Request, BackgroundTasks
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -34,7 +32,6 @@ from langchain_kreuzberg import KreuzbergLoader
 from kreuzberg import ExtractionConfig
 from prometheus_client import Histogram, Counter, Gauge, REGISTRY, generate_latest, CONTENT_TYPE_LATEST
 from fastapi.responses import Response
-from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response as StarletteResponse
 
@@ -48,25 +45,20 @@ class KBSettings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore"
     )
-
     qdrant_url: str = "http://qdrant:6333"
     qdrant_api_key: Optional[str] = None
 
     default_embedder_url: str = "https://api.openai.com/v1"
     default_embedder_model: str = "text-embedding-3-small"
-    default_embedder_dim: Optional[int] = 0
-    #default_embedder_dim: int = 1536
-    #default_embedder_url: str = "https://openrouter.ai/api/v1/embeddings"
-    #default_embedder_model: str = "baai/bge-m3"
-    #default_embedder_dim: int = 1024
+    default_embedder_dim: int = 1536  # Фикс: избегает ValidationError(size=0)
     default_api_key: Optional[str] = None
 
     jwt_secret: str
     jwt_algorithm: str = "HS256"
 
-    default_tokens_price: float = 0.02   # for 1M tokens
-    #pricing: Dict[str, float] = {"text-embedding-3-small": 0.02, "bge-m3": 0.01}
+    default_tokens_price: float = 0.02
     embed_max_batch_kb: int = 64
+
     default_chunk_size: int = 500
     default_chunk_overlap: int = 80
     default_separator: str = "--- BLOCK START ---"
@@ -77,20 +69,20 @@ class KBSettings(BaseSettings):
 
     calibration_default_min: float = 0.0
     calibration_default_max: float = 1.0
-    default_quota_kb: int = 5120  # 5 MB по умолчанию
+    default_quota_kb: int = 5120
 
     log_level: str = "INFO"
     uvicorn_timeout_keep_alive: int = 600
 
-    legacy_query_url: Optional[str] = None          # URL legacy-эндпоинта (/query)
-    legacy_proxy_timeout: float = 30.0              # Таймаут прокси-запроса
+    legacy_query_url: Optional[str] = None
+    legacy_proxy_timeout: float = 30.0
 
     @classmethod
     def from_env(cls) -> "KBSettings":
         return cls()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 📝 Логирование с контекстом (ТЗ 7.3: timestamp, level, request_id, tenant_id, endpoint)
+# 📝 Логирование с контекстом (ТЗ 7.3)
 # ─────────────────────────────────────────────────────────────────────────────
 request_id_var = contextvars.ContextVar("request_id", default="-")
 tenant_id_var = contextvars.ContextVar("tenant_id", default="-")
@@ -105,9 +97,8 @@ class ContextLogFilter(logging.Filter):
 
 logging.basicConfig(
     level=os.getenv("KBS_LOG_LEVEL", "INFO").upper(),
-    format='{"timestamp":"%(asctime)s","level":"%(levelname)s","service":"kbs","request_id":"%(request_id)s","tenant_id":"%(tenant_id)s","endpoint":"%(endpoint)s","msg":"%(message)s"}'
+    format='{"timestamp": "%(asctime)s", "level": "%(levelname)s", "service": "kbs", "request_id": "%(request_id)s", "tenant_id": "%(tenant_id)s", "endpoint": "%(endpoint)s", "msg": "%(message)s"}'
 )
-# Применяем фильтр ко всем существующим и будущим хендлерам
 for handler in logging.root.handlers:
     handler.addFilter(ContextLogFilter())
 logger = logging.getLogger("kbs")
@@ -121,9 +112,8 @@ QUERY_LATENCY = Histogram(f"{METRICS_PREFIX}query_duration_seconds", "Query pipe
 REQ_COUNTER = Counter(f"{METRICS_PREFIX}requests_total", "Total API requests", ["endpoint", "status"])
 SCORE_DIST = Histogram(f"{METRICS_PREFIX}score_distribution", "Calibrated score distribution", ["model_key"], buckets=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0])
 
-# Дрифт-метрики (PSI, mean, OOR ratio)
-DRIFT_PSI_GAUGE = Gauge(f"{METRICS_PREFIX}drift_psi", "Population Stability Index vs baseline", ["model_key"])
-SCORE_MEAN_GAUGE = Gauge(f"{METRICS_PREFIX}score_mean", "Rolling mean of raw cosine", ["model_key"])
+DRIFT_PSI_GAUGE = Gauge(f"{METRICS_PREFIX}drift_psi", "Population Stability Index vs previous baseline", ["model_key"])
+SCORE_MEAN_GAUGE = Gauge(f"{METRICS_PREFIX}score_mean", "Rolling mean of normalized score", ["model_key"])
 SCORE_OOR_RATIO_GAUGE = Gauge(f"{METRICS_PREFIX}score_out_of_range_ratio", "Ratio of scores outside calibrated range", ["model_key"])
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -157,7 +147,7 @@ class EmbedResponse(BaseModel):
 
 class QueryRequest(BaseModel):
     openai_api_key: Optional[str] = None
-    embedder_url: Optional[str] = None  # Позволяет сменить провайдера на лету
+    embedder_url: Optional[str] = None
     base_id: Optional[str] = None
     base_ids: Optional[List[str]] = None
     question: str = Field(..., min_length=1)
@@ -174,8 +164,8 @@ class ChunkResult(BaseModel):
     id: str
     page_content: str
     metadata: ChunkMetadata
-    relevance: float
-    raw_distance: float
+    raw_score: float = Field(..., description="Raw cosine score in range [-1, 1].")
+    relevance: float = Field(..., description="Vector relevance=(1+cosine)/2 in range [0, 1].")
 
 class QueryResponse(BaseModel):
     results: List[ChunkResult]
@@ -206,7 +196,6 @@ def cascade_chunk_markdown(
         strip_headers=True
     )
     header_docs = md_splitter.split_text(markdown_text)
-
     enriched = []
     for doc in header_docs:
         headers = [doc.metadata.get(h) for h in ["H1", "H2", "H3", "H4"] if doc.metadata.get(h)]
@@ -219,7 +208,7 @@ def cascade_chunk_markdown(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
         length_function=len,
-        separators=[separator, "\n\n", "\n", ". ", " ", ""],
+        separators=[separator, "\n\n", "\n", ". ", " ", "。"],
         keep_separator="end"
     )
     final_chunks = rec_splitter.split_documents(enriched)
@@ -231,7 +220,7 @@ def cascade_chunk_markdown(
     ]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 🧠 Stateless Service Class (DI + Lifecycle)
+# 🧠 Stateless Service Class (DI + Lifecycle + Recalibration)
 # ─────────────────────────────────────────────────────────────────────────────
 class KBSService:
     def __init__(self, backend: AsyncQdrantClient, settings: KBSettings):
@@ -239,17 +228,17 @@ class KBSService:
         self.settings = settings
         self._meta_collection = settings.meta_collection_name
         self._models_collection = settings.models_collection_name
-        
-        # Дрифт-трекер (in-memory)
-        self._score_windows: Dict[str, deque] = defaultdict(lambda: deque(maxlen=10000))
-        self._baselines: Dict[str, np.ndarray] = {}
-        self._bucket_edges = np.linspace(0.0, 1.0, 11)
+
+        # In-memory трекинг для rolling-калибровки
+        self._score_windows: Dict[str, deque] = defaultdict(lambda: deque(maxlen=500))
+        self._baselines: Dict[str, np.ndarray] = {}       # Кэш гистограммы
+        self._calib_cache: Dict[str, dict] = {}           # Кэш c_min, c_max, version
+        self._bucket_edges = np.linspace(0.0, 1.0, 51)    # 50 бинов
         self._lock = asyncio.Lock()
-        
+
         self.out_of_range_counter = Counter(
             f"{METRICS_PREFIX}calibration_out_of_range_total",
-            "Count of scores outside calibrated range",
-            ["model_key"]
+            "Count of scores outside calibrated range", ["model_key"]
         )
 
     def _get_clean_model_key(self, model: str) -> str:
@@ -258,6 +247,21 @@ class KBSService:
 
     def _get_collection_name(self, model: str) -> str:
         return f"{self.settings.collection_prefix}{self._get_clean_model_key(model)}"
+
+    async def _scroll_model(self, model_key: str, with_payload: bool = True) -> Optional[dict]:
+        """Безопасный scroll по kb_models (gRPC-совместимый): возвращает точку или ее payload"""
+        try:
+            pts, _ = await self.backend.scroll(
+                collection_name=self._models_collection,
+                scroll_filter=models.Filter(must=[
+                    models.FieldCondition(key="model_name", match=models.MatchValue(value=model_key))
+                ]),
+                limit=1, with_payload=with_payload, with_vectors=False
+            )
+            return pts if not with_payload else pts[0].payload if pts else None
+        except Exception as e:
+            logger.error(f"❌ Error in {self._models_collection} scroll by {model_key}: {e}", exc_info=True)
+            return None
 
     async def _extract_tenant_context(self, auth_header: Optional[str]) -> dict:
         if not auth_header or not auth_header.startswith("Bearer "):
@@ -269,7 +273,7 @@ class KBSService:
             )
             tenant_id = payload.get("tenant_id") or payload.get("sub")
             if not tenant_id: raise ValueError("tenant_id claim missing")
-            tenant_id_var.set(tenant_id)  # Для логирования
+            tenant_id_var.set(tenant_id)
             quota_kb = int(payload.get("tenant_quota_kb", self.settings.default_quota_kb))
             return {"tenant_id": tenant_id, "quota_kb": quota_kb}
         except (jwt.PyJWTError, ValueError, TypeError) as e:
@@ -290,18 +294,9 @@ class KBSService:
             raise HTTPException(403, detail=f"KB not found or access denied: {', '.join(missing)}")
         return found
 
-
     async def _delete_base_points(self, collection_name: str, tenant_id: str, base_id: str):
-        """
-        Удаляет точки БЗ из коллекции.
-        - Если коллекции нет: warning + продолжает выполнение (очистка orphan-метаданных).
-        - Если ошибка удаления: error + raise → HTTP 500 (требует вмешательства).
-        """
         if not collection_name:
-            logger.error(
-                f"❌ Internal error: collection_name is missing/empty for base_id={base_id}. "
-                f"Metadata is corrupted. Aborting deletion."
-            )
+            logger.error(f"❌ Internal error: collection_name is missing for base_id={base_id}. Aborting.")
             raise ValueError("Corrupted metadata: missing collection_name")
 
         selector = models.FilterSelector(
@@ -312,100 +307,139 @@ class KBSService:
         )
         try:
             await self.backend.delete(collection_name=collection_name, points_selector=selector)
-            logger.info(f"✅ Deleted points for base_id={base_id} (tenant={tenant_id}) from {collection_name}")
+            logger.info(f"✅ Deleted points for base_id={base_id} (tenant={tenant_id})")
         except Exception as e:
-            # Определяем: отсутствие коллекции или реальная ошибка?
-            if ((getattr(e, "status_code", None) == 404) or \
-                (callable(getattr(e, "code", None)) and e.code() == grpc.StatusCode.NOT_FOUND)
-            ):
-                logger.warning(
-                    f"⚠️ Collection '{collection_name}' missing for base_id={base_id}. "
-                    f"Proceeding with metadata cleanup (orphan reconciliation)."
-                )
-                return  # Не пробрасываем: даём вызывающему коду удалить запись из kb_metadata
-            else:
-                logger.error(f"❌ Point deletion failed for base_id={base_id} in {collection_name}:"
-                             f" {e}"
-                )
-                raise  # Пробрасываем → FastAPI вернёт HTTP 500
-
+            is_missing = (getattr(e, "status_code", None) == 404) or \
+                         (callable(getattr(e, "code", None)) and e.code() == grpc.StatusCode.NOT_FOUND)
+            if is_missing:
+                logger.warning(f"⚠️ Collection '{collection_name}' missing. Proceeding with metadata cleanup.")
+                return
+            logger.error(f"❌ Point deletion failed for base_id={base_id}: {e}")
+            raise
 
     async def _get_model_calibration(self, model_key: str) -> Optional[Dict[str, float]]:
-        try:
-            points, _ = await self.backend.scroll(
-                collection_name=self._models_collection,
-                scroll_filter=models.Filter(must=[
-                    models.FieldCondition(key="model_name", match=models.MatchValue(value=model_key))
-                ]),
-                limit=1, with_payload=["c_min", "c_max", "is_calibrated"], with_vectors=False
-            )
-            if points and points[0].payload.get("is_calibrated"):
-                return {"min": points[0].payload["c_min"], "max": points[0].payload["c_max"]}
-        except Exception: pass
+        """Возвращает кэшированные или загруженные границы калибровки в [0, 1]"""
+        if model_key in self._calib_cache:
+            cache = self._calib_cache[model_key]
+            return {"min": cache["c_min"], "max": cache["c_max"]}
+
+        state = await self._scroll_model(model_key)
+        if state:
+            self._calib_cache[model_key] = state
+            if state.get("baseline_hist"):
+                self._baselines[model_key] = np.array(state["baseline_hist"], dtype=np.float32)
+            return {"min": state["c_min"], "max": state["c_max"]}
         return None
 
     def _apply_calibration(self, raw_cosine: float, cal_params: Optional[Dict], model_key: str = "unknown") -> float:
+        # 1. Нормализуем raw_cosine [-1, 1] -> [0, 1]
         local = max(0.0, min(1.0, (raw_cosine + 1.0) / 2.0))
         if not cal_params:
             return local
 
         c_min = cal_params.get("min", self.settings.calibration_default_min)
         c_max = cal_params.get("max", self.settings.calibration_default_max)
-        
+
         if local < c_min or local > c_max:
             self.out_of_range_counter.labels(model_key=model_key).inc()
 
         if c_max - c_min < 1e-6:
-            logger.warning(f"Degenerate calibration for {model_key}: fallback to base norm.")
             return local
         return max(0.0, min(1.0, (local - c_min) / (c_max - c_min)))
 
-    def _record_metrics(self, model_key: str, scores: List[float]):
-        for s in scores:
-            SCORE_DIST.labels(model_key=model_key).observe(s)
+    def _calc_psi(self, baseline: np.ndarray, current: np.ndarray) -> float:
+        s_base = max(baseline.sum(), 1e-6)
+        s_curr = max(current.sum(), 1e-6)
+        psi = 0.0
+        for b, c in zip(baseline, current):
+            pct_b = b / s_base
+            pct_c = c / s_curr
+            psi += (pct_c - pct_b) * math.log(pct_c / pct_b + 1e-6)
+        return psi
 
-    async def _update_score_stats(self, model_key: str, scores: List[float]):
+    def _update_drift_metrics(self, model_key: str, curr_hist: np.ndarray, base_hist: np.ndarray, window: deque):
+        psi = self._calc_psi(base_hist, curr_hist) if base_hist.sum() > 0 else 0.0
+        DRIFT_PSI_GAUGE.labels(model_key=model_key).set(round(psi, 4))
+        SCORE_MEAN_GAUGE.labels(model_key=model_key).set(round(np.mean(list(window)), 4) if window else 0.0)
+        oor = sum(1 for s in window if s < 0.0 or s > 1.0) # Всегда 0 в [0,1], оставлено для совместимости
+        SCORE_OOR_RATIO_GAUGE.labels(model_key=model_key).set(0.0)
+
+    async def _update_score_stats(self, model_key: str, raw_scores: List[float]):
+        """Rolling-калибровка + детекция дрейфа + OCC-запись в Qdrant"""
+        norm_scores = [max(0.0, min(1.0, (s + 1.0) / 2.0)) for s in raw_scores]
+
         async with self._lock:
             window = self._score_windows[model_key]
-            window.extend(scores)
+            window.extend(norm_scores)
 
-            if model_key not in self._baselines:
-                try:
-                    pts, _ = await self.backend.scroll(
-                        collection_name=self._models_collection,
-                        scroll_filter=models.Filter(must=[
-                            models.FieldCondition(
-                                key="model_name", match=models.MatchValue(value=model_key)
-                            )
-                        ]),
-                        limit=1, with_payload=["baseline_hist"], with_vectors=False
-                    )
-                    if pts and pts[0].payload.get("baseline_hist"):
-                        self._baselines[model_key] = np.array(pts[0].payload["baseline_hist"], dtype=np.float32)
-                except Exception: pass
+            if len(window) < 500:
+                # Промежуточные метрики
+                base = self._baselines.get(model_key)
+                if base is not None:
+                    curr_hist, _ = np.histogram(list(window), bins=self._bucket_edges, density=False)
+                    self._update_drift_metrics(model_key, curr_hist, base, window)
+                return
 
-            if self._baselines.get(model_key) is None and len(window) >= 1000:
-                hist, _ = np.histogram(list(window), bins=self._bucket_edges, density=False)
-                await self.backend.set_payload(
-                    collection_name=self._models_collection,
-                    payload={"baseline_hist": [float(x) for x in hist]},
-                    points=[model_key]
-                )
-                self._baselines[model_key] = hist.astype(np.float32)
+            state = await self._scroll_model(model_key)
+            if not state:
+                window.clear()
+                return
 
-            if self._baselines.get(model_key) is not None and len(window) >= 500:
-                current_hist, _ = np.histogram(list(window), bins=self._bucket_edges, density=False)
-                baseline = self._baselines[model_key]
-                psi = 0.0
-                s_curr, s_base = sum(current_hist), sum(baseline)
-                for act, exp in zip(current_hist, baseline):
-                    act_pct = max(act / s_curr, 1e-6)
-                    exp_pct = max(exp / s_base, 1e-6)
-                    psi += (act_pct - exp_pct) * np.log(act_pct / exp_pct)
-                DRIFT_PSI_GAUGE.labels(model_key=model_key).set(round(psi, 4))
-                SCORE_MEAN_GAUGE.labels(model_key=model_key).set(round(np.mean(window), 4))
-                oor = sum(1 for s in window if s < self.settings.calibration_default_min or s > self.settings.calibration_default_max)
-                SCORE_OOR_RATIO_GAUGE.labels(model_key=model_key).set(round(oor / len(window), 4) if window else 0.0)
+            read_version = state.get("calib_version", 0)
+            current_baseline = np.array(state.get("baseline_hist", []), dtype=np.float32)
+            if current_baseline.size == 0:
+                current_baseline = np.zeros(50, dtype=np.float32)
+
+            temp_hist, _ = np.histogram(list(window), bins=self._bucket_edges, density=False)
+            merged_hist = (current_baseline + temp_hist).astype(np.float32)
+
+            # Извлечение перцентилей 2/98 из CDF слияния
+            cdf = np.cumsum(merged_hist)
+            total = cdf[-1]
+            if total == 0:
+                window.clear()
+                return
+            idx_min = np.searchsorted(cdf, total * 0.02)
+            idx_max = np.searchsorted(cdf, total * 0.98)
+            new_c_min = round(self._bucket_edges[min(idx_min, 49)], 4)
+            new_c_max = round(self._bucket_edges[min(idx_max, 49)], 4)
+
+            old_c_min = state.get("c_min", 0.0)
+            old_c_max = state.get("c_max", 1.0)
+
+            # Триггер обновления: значимое смещение границ
+            if abs(new_c_min - old_c_min) < 0.02 and abs(new_c_max - old_c_max) < 0.02:
+                curr_hist, _ = np.histogram(list(window), bins=self._bucket_edges, density=False)
+                self._update_drift_metrics(model_key, curr_hist, current_baseline, window)
+                window.clear()
+                return
+
+            # OCC: проверка версии перед записью
+            latest = await self._scroll_model(model_key)
+            if not latest or latest.get("calib_version", 0) != read_version:
+                logger.debug(f"Calibration race for {model_key}, skipping")
+                window.clear()
+                return
+
+            await self.backend.set_payload(
+                collection_name=self._models_collection,
+                payload={
+                    "c_min": new_c_min, "c_max": new_c_max,
+                    "baseline_hist": merged_hist.tolist(),
+                    "calib_version": read_version + 1,
+                    "total_scores": state.get("total_scores", 0) + len(window),
+                    "updated_at": time.time()
+                },
+                points=[model_key]
+            )
+
+            self._calib_cache[model_key] = {"c_min": new_c_min, "c_max": new_c_max, "calib_version": read_version + 1}
+            self._baselines[model_key] = merged_hist
+            
+            curr_hist, _ = np.histogram(list(window), bins=self._bucket_edges, density=False)
+            self._update_drift_metrics(model_key, curr_hist, current_baseline, window)
+            window.clear()
+            logger.info(f"✅ Recalibrated {model_key}: c_min={new_c_min}, c_max={new_c_max} v{read_version+1}")
 
     async def _batch_embed(self, model: str, url: str, api_key: str, texts: List[str], is_default: bool):
         if is_default:
@@ -431,43 +465,39 @@ class KBSService:
             return self.settings.default_embedder_dim
 
     async def _auto_calibrate_if_new(self, model_key: str, vectors: List[List[float]]):
-        try:
-            pts, _ = await self.backend.scroll(
-                collection_name=self._models_collection,
-                scroll_filter=models.Filter(must=[
-                    models.FieldCondition(key="model_name", match=models.MatchValue(value=model_key))
-                ]),
-                limit=1, with_payload=["is_calibrated"], with_vectors=False
-            )
-            if pts and pts[0].payload.get("is_calibrated"): return
-        except Exception: pass
-
-        if len(vectors) < 50: return
+        """Первичная калибровка модели"""
+        state = await self._scroll_model(model_key, with_payload=False)
+        if state or len(vectors) < 50:  return
 
         def _compute():
-            subset = random.sample(vectors, min(len(vectors), 100))
-            norms = [math.sqrt(sum(x*x for x in v)) for v in subset]
-            normed = [[x/n for x in v] for v, n in zip(subset, norms)]
-            sims = []
-            for i in range(len(normed)):
-                for j in range(i + 1, len(normed)):
-                    sims.append(sum(a * b for a, b in zip(normed[i], normed[j])))
-            c_min, c_max = float(np.percentile(sims, 2)), float(np.percentile(sims, 98))
-            if c_max - c_min < 0.1:
-                c_min, c_max = max(-0.2, c_min - 0.05), min(0.95, c_max + 0.05)
-            return round(c_min, 4), round(c_max, 4)
+            subset = np.array(random.sample(vectors, min(len(vectors), 100)), dtype=np.float32)
+            norms  = np.linalg.norm(subset, axis=1, keepdims=True)
+            norms[norms<1e-9] = 1e-9
+            normed = subset / norms
+            ij = np.triu_indices(len(normed), k=1)
+            sims = ((normed @ normed.T)[ij] +1) /2
+            c_min, c_max = np.percentile(sims, 2), np.percentile(sims, 98)
+            hist, _ = np.histogram(sims, bins=self._bucket_edges, density=False)
+            return round(c_min, 4), round(c_max, 4), hist.astype(np.float32)
 
-        c_min, c_max = await asyncio.to_thread(_compute)
-        await self.backend.set_payload(
+        c_min, c_max, baseline = await asyncio.to_thread(_compute)
+        
+        await self.backend.upsert(
             collection_name=self._models_collection,
-            payload={
-                "c_min": c_min, "c_max": c_max, "is_calibrated": True,
-                "fitted_at": time.time(), "method": "batch_pairwise_percentiles", 
-                "sample_size": len(vectors)
-            },
-            points=[model_key]
+            points=[models.PointStruct(
+                id=model_key, vector=[0.0],
+                payload={
+                    "model_name": model_key,
+                    "c_min": c_min, "c_max": c_max,
+                    "calib_version": 1, "total_scores": 0,
+                    "baseline_hist": baseline.tolist(),
+                    "fitted_at": time.time(), "method": "batch_pairwise_percentiles"
+                }
+            )]
         )
-        logger.info(f"Auto-calibrated {model_key}: c_min={c_min}, c_max={c_max}")
+        self._calib_cache[model_key] = {"c_min": c_min, "c_max": c_max, "calib_version": 1}
+        self._baselines[model_key] = baseline
+        logger.info(f"🆕 Initial calibration for {model_key}: [{c_min}, {c_max}]")
 
     async def _parse_and_chunk(self, req: EmbedRequest) -> tuple[List[Dict[str, Any]], Dict[str, str]]:
         def _sync_process() -> tuple[List[Dict[str, Any]], Dict[str, str]]:
@@ -519,20 +549,18 @@ class KBSService:
 
         # 1. Логика перезаписи (если base_id уже существует в метаданных)
         if req.base_id:
-            # Используем scroll с фильтром, т.к. base_id может быть не UUID
             old_pts, _ = await self.backend.scroll(
                 collection_name=self._meta_collection,
                 scroll_filter=models.Filter(must=[
                     models.FieldCondition(key="base_id", match=models.MatchValue(value=req.base_id)),
                     models.FieldCondition(key="tenant_id", match=models.MatchValue(value=tenant_id))
                 ]),
-                limit=1, with_payload=True, with_vectors=False
+                limit=1, with_payload=["collection_name"], with_vectors=False
             )
             if old_pts:
-                old_cfg = old_pts[0].payload
-                old_coll = old_cfg.get("collection_name")
+                old_coll = old_pts[0].payload.get("collection_name")
                 await self._delete_base_points(old_coll, tenant_id, req.base_id)
-                await self.backend.delete(            # Удаляем старый конфиг из метаданных
+                await self.backend.delete(  # Удаляем старый конфиг из метаданных (осв. квоту!)
                     collection_name=self._meta_collection,
                     points_selector=models.PointIdsList(points=[req.base_id])
                 )
@@ -606,14 +634,36 @@ class KBSService:
                         size=actual_dim, distance=models.Distance.COSINE
                     )
                 )
+                await self.backend.create_payload_index(
+                    collection_name=collection_name,
+                    field_name="tenant_id",
+                    field_schema={"type": "keyword", "is_tenant": True}
+                )
+                await self.backend.create_payload_index(
+                    collection_name=collection_name,
+                    field_name="base_id",
+                    field_schema="keyword"
+                )
                 logger.info(f"🆕 Created collection {collection_name}")
             except Exception as e:
-                if "already exists" in str(e).lower():
-                    logger.info(f"ℹ️ Collection {collection_name} already exists (concurrent creation)")
-                else:
+                if "already exists" not in str(e).lower():
                     raise HTTPException(500, detail=f"Collection init failed: {e}")
 
-        # 7. Загрузка векторов в Qdrant
+        # 7. Write-ahead конфига БЗ в метаданные
+        await self.backend.upsert(collection_name=self._meta_collection, points=[models.PointStruct(
+            id=base_id, vector=[0.0], payload={
+                "type": "kb_config", "tenant_id": tenant_id, "base_id": base_id,
+                "collection_name": collection_name, "documents": documents_map,
+                "embedding_config": {
+                    "type": "platform" if is_default else "custom",
+                    "model_name": actual_model, "dimension": actual_dim, "url": actual_url
+                },
+                "size_kb": round(processed_kb, 2), "created_at": time.time()
+            }
+        )])
+        logger.info(f"✅ Metadata write-ahead completed for base_id={base_id}")
+
+        # 8. Загрузка векторов в Qdrant
         points_to_upsert = [
             models.PointStruct(
                 id=c["id"], vector=all_vectors[i],
@@ -623,22 +673,22 @@ class KBSService:
                 }
             ) for i, c in enumerate(chunks)
         ]
-        await self.backend.upsert(collection_name=collection_name, points=points_to_upsert)
+        try:
+            await self.backend.upsert(collection_name=collection_name, points=points_to_upsert)
+            logger.info(f"✅ Data upload completed for base_id={base_id} ({len(points_to_upsert)} points)")
+        except Exception as e:
+            logger.error(f"❌ Vector upsert failed for base_id={base_id}: {e}", exc_info=True)
+            raise HTTPException(500, detail=f"Failed to store vectors: {e}")
 
-        # 8. Сохранение конфига БЗ в метаданные (с точным размером)
-        await self.backend.upsert(collection_name=self._meta_collection, points=[models.PointStruct(
-            id=base_id, vector=[0.0], payload={
-                "type": "kb_config", "tenant_id": tenant_id, "base_id": base_id,
-                "collection_name": collection_name, "documents": documents_map,
-                "embedding_config": {
-                    "type": "platform" if is_default else "custom",
-                    "model_name": actual_model, "dimension": actual_dim, "url": actual_url
-                },
-                "size_kb": round(processed_kb, 2), "created_at": time.time(), "updated_at": time.time()
-            }
-        )])
+        # 9. Отражаем факт успешной загрузки в конфиге БЗ
+        await self.backend.set_payload(
+            collection_name=self._meta_collection,
+            payload={"updated_at": time.time()},
+            points=[base_id]
+        )
+        logger.info(f"✅ Metadata finalized for base_id={base_id}")
 
-        # 9. Метрики и ответ
+        # 10. Метрики и ответ
         EMBED_LATENCY.observe(time.time() - start)
         REQ_COUNTER.labels(endpoint="/embed", status="success").inc()
         return EmbedResponse(
@@ -656,38 +706,55 @@ class KBSService:
         all_results, total_tokens, total_cost, model_keys_seen = [], 0, 0.0, set()
 
         for cfg in kb_configs.values():
+            if  not "updated_at" in cfg: raise HTTPException(
+                423,  # Locked
+                detail=f"Knowledge base {cfg['base_id']} is still loading or load has been failed."
+            )
             ec = cfg["embedding_config"]
             model_key = self._get_clean_model_key(ec['model_name'])
             model_keys_seen.add(model_key)
             
             cal_params = await self._get_model_calibration(model_key)
-            vec, t, c = await self._batch_embed(ec["model_name"], ec.get("url"), api_key or req.openai_api_key, [req.question], ec.get("type") == "platform")
-            total_tokens += t
-            total_cost += c
+            vec, t, c = await self._batch_embed(
+                ec["model_name"], ec.get("url"), api_key or req.openai_api_key, 
+                [req.question], ec.get("type") == "platform"
+            )
+            total_tokens += t; total_cost += c
 
-            hits = await self.backend.search(collection_name=cfg["collection_name"], query_vector=vec[0], limit=req.k,
+            hits = await self.backend.search(collection_name=cfg["collection_name"], 
+                query_vector=vec[0], limit=req.k * len(kb_configs),
                 query_filter=models.Filter(must=[
                     models.FieldCondition(key="tenant_id", match=models.MatchValue(value=tenant_id)),
                     models.FieldCondition(key="base_id", match=models.MatchValue(value=cfg["base_id"]))
                 ]), with_payload=["text", "doc_id"], with_vectors=False)
             
             scores, docs_map = [], cfg.get("documents", {})
+            raw_scores = []
             for h in hits:
+                raw_scores.append(h.score)
                 calibrated = self._apply_calibration(h.score, cal_params, model_key)
                 scores.append(calibrated)
-                if req.relevance_threshold is not None and calibrated < req.relevance_threshold: continue
-                all_results.append(ChunkResult(base_id=f"emb_db:{cfg['base_id']}", id=str(h.id), page_content=h.payload.get("text", ""),
-                    metadata=ChunkMetadata(doc_id=h.payload.get("doc_id", ""), source=docs_map.get(h.payload.get("doc_id"), "unknown")),
-                    relevance=round(calibrated, 4), raw_distance=round(h.score, 4)))
+                if req.relevance_threshold and calibrated < req.relevance_threshold: continue
+                all_results.append(ChunkResult(base_id=f"emb_db:{cfg['base_id']}", 
+                    id=str(h.id), page_content=h.payload.get("text", ""),
+                    metadata=ChunkMetadata(doc_id=h.payload.get("doc_id", ""), 
+                    source=docs_map.get(h.payload.get("doc_id"), "unknown")),
+                    relevance=round(calibrated, 4), raw_score=round(h.score, 4)))
             
             self._record_metrics(model_key, scores)
-            await self._update_score_stats(model_key, scores)
+            await self._update_score_stats(model_key, raw_scores)
 
         all_results.sort(key=lambda x: x.relevance, reverse=True)
-        QUERY_LATENCY.labels(model_key=";".join(model_keys_seen)).observe(time.time() - start)
+        QUERY_LATENCY.labels(model_key="; ".join(model_keys_seen)).observe(time.time() - start)
         REQ_COUNTER.labels(endpoint="/query", status="success").inc()
-        return QueryResponse(results=all_results, tokens=total_tokens, cost_usd=total_cost)
+        return QueryResponse(results=all_results[:req.k], tokens=total_tokens, cost_usd=total_cost)
 
+    async def _collection_exists(self, collection_name: str) -> bool:
+        try:
+            collections = await self.backend.get_collections()
+            return any(c.name == collection_name for c in collections.collections)
+        except Exception:
+            return False
 
     async def remove(self, req: RemoveRequest, tenant_ctx: dict) -> Dict[str, str]:
         tenant_id = tenant_ctx["tenant_id"]
@@ -733,7 +800,8 @@ async def lifespan(app: FastAPI):
             )
             if name == settings.meta_collection_name:
                 await backend.create_payload_index(
-                    collection_name=name, field_name="tenant_id", field_schema="keyword"
+                    collection_name=name, field_name="tenant_id", 
+                    field_schema={"type": "keyword", "is_tenant": True}
                 )
                 await backend.create_payload_index(
                     collection_name=name, field_name="base_id", field_schema="keyword"
@@ -758,7 +826,7 @@ app.state.settings = KBSettings.from_env()
 # ─────────────────────────────────────────────────────────────────────────────
 # 🧠 Middleware для сквозного логирования (ТЗ 7.3)
 # ─────────────────────────────────────────────────────────────────────────────
-#@app.middleware("http")
+@app.middleware("http")
 async def request_context_middleware(request: Request, call_next):
     req_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
     request_id_var.set(req_id)
@@ -770,7 +838,7 @@ async def request_context_middleware(request: Request, call_next):
 # ─────────────────────────────────────────────────────────────────────────────
 # 🧠 Middleware для проксирования запросов на legacy endpoint
 # ─────────────────────────────────────────────────────────────────────────────
-#@app.middleware("http")
+@app.middleware("http")
 async def legacy_proxy_middleware(request: Request, call_next):
     """
     Проксирует запросы к старым БЗ на legacy-эндпоинт.
@@ -824,27 +892,27 @@ async def health_check(kbs: KBSService = Depends(get_kbs)):
     return await kbs.health()
 
 @app.post("/api/v1/kb/embed", response_model=EmbedResponse)
-async def embed_kb(req: EmbedRequest, bg: BackgroundTasks, 
-                   authorization: str = Header(..., alias="Authorization"), 
-                   x_embed_key: Optional[str] = Header(None, alias="X-Embedding-API-Key"), 
-                   kbs: KBSService = Depends(get_kbs)
+async def embed_kb(req: EmbedRequest, bg: BackgroundTasks,
+    authorization: str = Header(..., alias="Authorization"),
+    x_embed_key: Optional[str] = Header(None, alias="X-Embedding-API-Key"),
+    kbs: KBSService = Depends(get_kbs)
 ):
     tenant_ctx = await kbs._extract_tenant_context(authorization)
     return await kbs.embed(req, tenant_ctx, x_embed_key, bg)
 
 @app.post("/api/v1/kb/query", response_model=QueryResponse)
-async def query_kb(req: QueryRequest, 
-                   authorization: str = Header(..., alias="Authorization"), 
-                   x_embed_key: Optional[str] = Header(None, alias="X-Embedding-API-Key"), 
-                   kbs: KBSService = Depends(get_kbs)
+async def query_kb(req: QueryRequest,
+    authorization: str = Header(..., alias="Authorization"),
+    x_embed_key: Optional[str] = Header(None, alias="X-Embedding-API-Key"),
+    kbs: KBSService = Depends(get_kbs)
 ):
     tenant_ctx = await kbs._extract_tenant_context(authorization)
     return await kbs.query(req, tenant_ctx, x_embed_key)
 
 @app.post("/api/v1/kb/remove")
-async def remove_kb(req: RemoveRequest, 
-                    authorization: str = Header(..., alias="Authorization"), 
-                    kbs: KBSService = Depends(get_kbs)
+async def remove_kb(req: RemoveRequest,
+    authorization: str = Header(..., alias="Authorization"),
+    kbs: KBSService = Depends(get_kbs)
 ):
     tenant_ctx = await kbs._extract_tenant_context(authorization)
     return await kbs.remove(req, tenant_ctx)
