@@ -58,6 +58,7 @@ class KBSettings(BaseSettings):
 
     default_tokens_price: float = 0.02
     embed_max_batch_kb: int = 64
+    default_quota_kb: int = 5120
 
     default_chunk_size: int = 500
     default_chunk_overlap: int = 80
@@ -69,7 +70,7 @@ class KBSettings(BaseSettings):
 
     calibration_default_min: float = 0.0
     calibration_default_max: float = 1.0
-    default_quota_kb: int = 5120
+    calibration_min_delta:   float = 1e-6
 
     log_level: str = "INFO"
     uvicorn_timeout_keep_alive: int = 600
@@ -114,7 +115,6 @@ SCORE_DIST = Histogram(f"{METRICS_PREFIX}score_distribution", "Calibrated score 
 
 DRIFT_PSI_GAUGE = Gauge(f"{METRICS_PREFIX}drift_psi", "Population Stability Index vs previous baseline", ["model_key"])
 SCORE_MEAN_GAUGE = Gauge(f"{METRICS_PREFIX}score_mean", "Rolling mean of normalized score", ["model_key"])
-SCORE_OOR_RATIO_GAUGE = Gauge(f"{METRICS_PREFIX}score_out_of_range_ratio", "Ratio of scores outside calibrated range", ["model_key"])
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 📦 Pydantic Models (ТЗ 5.3)
@@ -331,21 +331,22 @@ class KBSService:
             return {"min": state["c_min"], "max": state["c_max"]}
         return None
 
-    def _apply_calibration(self, raw_cosine: float, cal_params: Optional[Dict], model_key: str = "unknown") -> float:
-        # 1. Нормализуем raw_cosine [-1, 1] -> [0, 1]
-        local = max(0.0, min(1.0, (raw_cosine + 1.0) / 2.0))
-        if not cal_params:
-            return local
 
+    def _apply_calibration(self, raw_cosine: float, cal_params: Optional[Dict], model_key: str = "unknown") -> float:
+        # Преобразуем raw_cosine [-1, 1] в relevance [0, 1]
+        relev = max(0.0, min(1.0, (raw_cosine + 1.0) / 2.0))
+        if not cal_params:  return relev
+
+        # Если модель калибрована - берем ее c_min и c_max
         c_min = cal_params.get("min", self.settings.calibration_default_min)
         c_max = cal_params.get("max", self.settings.calibration_default_max)
-
-        if local < c_min or local > c_max:
+        if relev < c_min or relev > c_max:
             self.out_of_range_counter.labels(model_key=model_key).inc()
 
-        if c_max - c_min < 1e-6:
-            return local
-        return max(0.0, min(1.0, (local - c_min) / (c_max - c_min)))
+        # Нормализуем relevance в калибровочный интервал
+        if c_max - c_min < self.settings.calibration_min_delta:  return relev
+        return max(0.0, min(1.0, (relev - c_min) / (c_max - c_min)))
+
 
     def _calc_psi(self, baseline: np.ndarray, current: np.ndarray) -> float:
         s_base = max(baseline.sum(), 1e-6)
@@ -357,68 +358,65 @@ class KBSService:
             psi += (pct_c - pct_b) * math.log(pct_c / pct_b + 1e-6)
         return psi
 
-    def _update_drift_metrics(self, model_key: str, curr_hist: np.ndarray, base_hist: np.ndarray, window: deque):
+
+    def _record_drift_metrics(self, model_key: str, curr_hist: np.ndarray, base_hist: np.ndarray, window: deque):
         psi = self._calc_psi(base_hist, curr_hist) if base_hist.sum() > 0 else 0.0
         DRIFT_PSI_GAUGE.labels(model_key=model_key).set(round(psi, 4))
         SCORE_MEAN_GAUGE.labels(model_key=model_key).set(round(np.mean(list(window)), 4) if window else 0.0)
-        oor = sum(1 for s in window if s < 0.0 or s > 1.0) # Всегда 0 в [0,1], оставлено для совместимости
-        SCORE_OOR_RATIO_GAUGE.labels(model_key=model_key).set(0.0)
+        
 
     async def _update_score_stats(self, model_key: str, raw_scores: List[float]):
-        """Rolling-калибровка + детекция дрейфа + OCC-запись в Qdrant"""
-        norm_scores = [max(0.0, min(1.0, (s + 1.0) / 2.0)) for s in raw_scores]
+        """Rolling-калибровка + baseline + PSI (работает даже при cold-start <50)"""
+        async with self._lock:
+            # Преобразуем raw_scores в relevance и отписываем в скользящее окно
+            self._score_windows[model_key].extend((np.array(raw_scores, dtype=np.float32) + 1)/2)
+
+            # Делаем snapshot окна и выходим, если не набрали 500 скоров
+            window = list(self._score_windows[model_key])
+            if len(window) < 500: return
+
+        # 1. Загружаем текущее состояние из Qdrant (или None, если холодный старт)
+        state = await self._scroll_model(model_key) or {}
+        baseline_hist = np.array(state.get("baseline_hist", []), dtype=np.float32)
+        old_c_min = state.get("c_min", self.settings.calibration_default_min)
+        old_c_max = state.get("c_max", self.settings.calibration_default_max)
+        version = state.get("calib_version", 0)
+
+        # 2. Если baseline ещё нет, создаём его из текущего окна, иначе сливаем гистограммы
+        wind_hist, _ = np.histogram(list(window), bins=self._bucket_edges, density=False)
+        if baseline_hist.size == 0:
+            baseline_hist = merged_hist = wind_hist
+            logger.info(f"📊 Created initial baseline for {model_key} from first {len(window)} scores")
+        else:
+            merged_hist = (baseline_hist + wind_hist).astype(np.float32)
+        
+        # Отписываем метрики дрифта статистик relevance
+        self._record_drift_metrics(model_key, wind_hist, baseline_hist, window)
+        
+        # 3. Считаем новые границы калибровочного диапазона по 2- и 98-персентилям
+        cdf = np.cumsum(merged_hist)
+        total = cdf[-1]
+        idx_min = np.clip(np.searchsorted(cdf, total * 0.02), 0, len(self._bucket_edges)-1)
+        idx_max = np.clip(np.searchsorted(cdf, total * 0.98), 0, len(self._bucket_edges)-1)
+        new_c_min = round(self._bucket_edges[idx_min], 4)
+        new_c_max = round(self._bucket_edges[idx_max], 4)
+
+        # 4. Не обновляем калибровку если границы не сместились
+        if abs(new_c_min - old_c_min) < 0.02 and abs(new_c_max - old_c_max) < 0.02:
+            logger.debug(f"Drift within tolerance for {model_key}, skipping recalibration...")
+            async with self._lock:
+                self._score_windows[model_key].clear()
+            return
 
         async with self._lock:
-            window = self._score_windows[model_key]
-            window.extend(norm_scores)
-
-            if len(window) < 500:
-                # Промежуточные метрики
-                base = self._baselines.get(model_key)
-                if base is not None:
-                    curr_hist, _ = np.histogram(list(window), bins=self._bucket_edges, density=False)
-                    self._update_drift_metrics(model_key, curr_hist, base, window)
-                return
-
-            state = await self._scroll_model(model_key)
-            if not state:
-                window.clear()
-                return
-
-            read_version = state.get("calib_version", 0)
-            current_baseline = np.array(state.get("baseline_hist", []), dtype=np.float32)
-            if current_baseline.size == 0:
-                current_baseline = np.zeros(50, dtype=np.float32)
-
-            temp_hist, _ = np.histogram(list(window), bins=self._bucket_edges, density=False)
-            merged_hist = (current_baseline + temp_hist).astype(np.float32)
-
-            # Извлечение перцентилей 2/98 из CDF слияния
-            cdf = np.cumsum(merged_hist)
-            total = cdf[-1]
-            if total == 0:
-                window.clear()
-                return
-            idx_min = np.searchsorted(cdf, total * 0.02)
-            idx_max = np.searchsorted(cdf, total * 0.98)
-            new_c_min = round(self._bucket_edges[min(idx_min, 49)], 4)
-            new_c_max = round(self._bucket_edges[min(idx_max, 49)], 4)
-
-            old_c_min = state.get("c_min", 0.0)
-            old_c_max = state.get("c_max", 1.0)
-
-            # Триггер обновления: значимое смещение границ
-            if abs(new_c_min - old_c_min) < 0.02 and abs(new_c_max - old_c_max) < 0.02:
-                curr_hist, _ = np.histogram(list(window), bins=self._bucket_edges, density=False)
-                self._update_drift_metrics(model_key, curr_hist, current_baseline, window)
-                window.clear()
-                return
-
-            # OCC: проверка версии перед записью
-            latest = await self._scroll_model(model_key)
-            if not latest or latest.get("calib_version", 0) != read_version:
-                logger.debug(f"Calibration race for {model_key}, skipping")
-                window.clear()
+            # 5. OCC-запись в Qdrant (безопасно при конкурентности)
+            latest = await self._scroll_model(model_key) or {}
+            if latest.get("calib_version", 0) != version:
+                logger.debug(f"⏭️ Calibration race for {model_key}, skipping recalibration...")
+                # OCC: если версия изменилась, значит другой процесс уже обновил калибровку
+                # и очистил окно. Мы выходим без побочных эффектов, чтобы не потерять
+                # новые скоры, накопившиеся после очистки победителем.
+                #window.clear()
                 return
 
             await self.backend.set_payload(
@@ -426,20 +424,20 @@ class KBSService:
                 payload={
                     "c_min": new_c_min, "c_max": new_c_max,
                     "baseline_hist": merged_hist.tolist(),
-                    "calib_version": read_version + 1,
-                    "total_scores": state.get("total_scores", 0) + len(window),
+                    "calib_version": version + 1,
+                    "total_scores": latest.get("total_scores", 0) + len(window),
                     "updated_at": time.time()
                 },
                 points=[model_key]
             )
 
-            self._calib_cache[model_key] = {"c_min": new_c_min, "c_max": new_c_max, "calib_version": read_version + 1}
+            # 6. Обновляем in-memory кэш и логи
             self._baselines[model_key] = merged_hist
+            self._calib_cache[model_key] = {"c_min": new_c_min, "c_max": new_c_max}
             
-            curr_hist, _ = np.histogram(list(window), bins=self._bucket_edges, density=False)
-            self._update_drift_metrics(model_key, curr_hist, current_baseline, window)
-            window.clear()
-            logger.info(f"✅ Recalibrated {model_key}: c_min={new_c_min}, c_max={new_c_max} v{read_version+1}")
+            self._score_windows[model_key].clear()
+        logger.info(f"✅ Recalibrated {model_key}: [{new_c_min}, {new_c_max}] v{version+1}")
+
 
     async def _batch_embed(self, model: str, url: str, api_key: str, texts: List[str], is_default: bool):
         if is_default:
@@ -524,6 +522,16 @@ class KBSService:
                     logger.warning(f"Parse failed for {src}: {e}")
             return all_chunks, documents_map
         return await asyncio.to_thread(_sync_process)
+
+
+    async def _collection_exists(self, collection_name: str) -> bool:
+        try:
+            collections = await self.backend.get_collections()
+            return any(c.name == collection_name for c in collections.collections)
+        except Exception as e:
+            logger.error(f"❌ Qdrant.get_collections() failed: {e}")
+            return False
+
 
     async def health(self) -> HealthResponse:
         try:
@@ -702,25 +710,31 @@ class KBSService:
         base_ids = list({req.base_id} if req.base_id else set(req.base_ids or []))
         if not base_ids: raise HTTPException(400, detail="base_id or base_ids required")
 
+        # Извлекаем сведения о требуемых БЗ из kb_metadata
         kb_configs = await self._fetch_kb_meta(tenant_id, base_ids)
         all_results, total_tokens, total_cost, model_keys_seen = [], 0, 0.0, set()
 
+        # Извлекаем релевантные запросу чанки из каждой БЗ
         for cfg in kb_configs.values():
             if  not "updated_at" in cfg: raise HTTPException(
                 423,  # Locked
                 detail=f"Knowledge base {cfg['base_id']} is still loading or load has been failed."
             )
+
+            # Извлекаем конфигурацию эмбеддера для данной БЗ
             ec = cfg["embedding_config"]
             model_key = self._get_clean_model_key(ec['model_name'])
             model_keys_seen.add(model_key)
-            
             cal_params = await self._get_model_calibration(model_key)
+
+            # Получаем эмбеддинг запроса пользователя
             vec, t, c = await self._batch_embed(
                 ec["model_name"], ec.get("url"), api_key or req.openai_api_key, 
                 [req.question], ec.get("type") == "platform"
             )
             total_tokens += t; total_cost += c
 
+            # Ищем релевантные чанки в БЗ (количество чанков берем с запасом)
             hits = await self.backend.search(collection_name=cfg["collection_name"], 
                 query_vector=vec[0], limit=req.k * len(kb_configs),
                 query_filter=models.Filter(must=[
@@ -728,42 +742,40 @@ class KBSService:
                     models.FieldCondition(key="base_id", match=models.MatchValue(value=cfg["base_id"]))
                 ]), with_payload=["text", "doc_id"], with_vectors=False)
             
-            scores, docs_map = [], cfg.get("documents", {})
-            raw_scores = []
+            # Фильтруем извлеченные чанки по relevance_threshold и добавляем их в all_results
+            raw_scores, scores, docs_map = [], [], cfg.get("documents", {})
             for h in hits:
                 raw_scores.append(h.score)
                 calibrated = self._apply_calibration(h.score, cal_params, model_key)
                 scores.append(calibrated)
                 if req.relevance_threshold and calibrated < req.relevance_threshold: continue
-                all_results.append(ChunkResult(base_id=f"emb_db:{cfg['base_id']}", 
+                all_results.append(ChunkResult(
+                    base_id=f"emb_db:{cfg['base_id']}", 
                     id=str(h.id), page_content=h.payload.get("text", ""),
-                    metadata=ChunkMetadata(doc_id=h.payload.get("doc_id", ""), 
-                    source=docs_map.get(h.payload.get("doc_id"), "unknown")),
-                    relevance=round(calibrated, 4), raw_score=round(h.score, 4)))
+                    metadata=ChunkMetadata(
+                        doc_id=h.payload.get("doc_id", ""), 
+                        source=docs_map.get(h.payload.get("doc_id"), "unknown")
+                    ),
+                    relevance=round(calibrated, 4), raw_score=round(h.score, 4)
+                ))
             
-            self._record_metrics(model_key, scores)
+            # Отписываем scores в метрики 
+            for s in scores: SCORE_DIST.labels(model_key=model_key).observe(s)
             await self._update_score_stats(model_key, raw_scores)
 
+        # Сортируем все извлеченные чанки по релевантности и формируем ответ
         all_results.sort(key=lambda x: x.relevance, reverse=True)
         QUERY_LATENCY.labels(model_key="; ".join(model_keys_seen)).observe(time.time() - start)
         REQ_COUNTER.labels(endpoint="/query", status="success").inc()
         return QueryResponse(results=all_results[:req.k], tokens=total_tokens, cost_usd=total_cost)
 
-    async def _collection_exists(self, collection_name: str) -> bool:
-        try:
-            collections = await self.backend.get_collections()
-            return any(c.name == collection_name for c in collections.collections)
-        except Exception:
-            return False
 
     async def remove(self, req: RemoveRequest, tenant_ctx: dict) -> Dict[str, str]:
         tenant_id = tenant_ctx["tenant_id"]
         cfg = (await self._fetch_kb_meta(tenant_id, [req.base_id]))[req.base_id]
         
-        # _delete_base_points сам решит: warning (нет коллекции) или raise (ошибка удаления)
+        # Удаляем точки БЗ и ее конфиг из мета-коллекции
         await self._delete_base_points(cfg["collection_name"], tenant_id, req.base_id)
-        
-        # Удаляем конфиг из мета-коллекции (квота освободится автоматически при следующем /embed)
         await self.backend.delete(
             collection_name=self._meta_collection, 
             points_selector=models.PointIdsList(points=[req.base_id])

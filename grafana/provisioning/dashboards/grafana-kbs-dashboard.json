@@ -62,7 +62,7 @@
       "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 0.01 }, { "color": "red", "value": 0.05 }] }, "unit": "percentunit" }, "overrides": [] },
       "gridPos": { "h": 9, "w": 12, "x": 12, "y": 10 }, "id": 6,
       "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
-      "targets": [{ "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(rate(kbs_calibration_out_of_range_total{model_key=~\"$model_key\"}[5m])) by (model_key) / sum(rate(kbs_score_distribution_count{model_key=~\"$model_key\"}[5m])) by (model_key)", "legendFormat": "{{model_key}}", "refId": "A" }],
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(rate(kbs_calibration_out_of_range_total{model_key=~\"$model_key\"}[5m])) by (model_key) / sum(rate(kbs_score_distribution_count{model_key=~\"$model_key\"}[5m])) by (model_key) or vector(0)", "legendFormat": "{{model_key}}", "refId": "A" }],
       "title": "Out-of-Range Ratio (calibration health)", "type": "stat"
     },
     { "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 19 }, "id": 7, "panels": [], "title": "📉 Drift Monitoring", "type": "row" },
@@ -103,7 +103,7 @@
       "targets": [
         { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "kbs_drift_psi", "format": "table", "instant": true, "refId": "PSI" },
         { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "kbs_score_mean", "format": "table", "hide": false, "instant": true, "refId": "MEAN" },
-        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "kbs_score_out_of_range_ratio", "format": "table", "hide": false, "instant": true, "refId": "OOR" }
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(rate(kbs_calibration_out_of_range_total{model_key=~\"$model_key\"}[5m])) by (model_key) / sum(rate(kbs_score_distribution_count{model_key=~\"$model_key\"}[5m])) by (model_key) or vector(0)", "format": "table", "hide": false, "instant": true, "refId": "OOR" }
       ],
       "title": "Model Health Summary",
       "transformations": [
