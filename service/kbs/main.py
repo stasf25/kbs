@@ -622,7 +622,7 @@ class KBSService:
             )
             if old_pts:
                 old_coll = old_pts[0].payload.get("collection_name")
-                await self._delete_base_points(old_coll, tenant_id, req.base_id)
+                await self._delete_base_points(old_coll, tenant_id, base_id)
                 await self.backend.delete(  # Удаляем старый конфиг из метаданных (осв. квоту!)
                     collection_name=self._meta_collection,
                     points_selector=models.PointIdsList(points=[old_pts[0].id])
@@ -687,7 +687,7 @@ class KBSService:
 
         # 6. Создание коллекции (если ещё нет)
         if not actual_dim:
-            actual_dim = await self._detect_embedding_dimension(
+            actual_dim = len(all_vectors[0]) if all_vectors else await self._detect_embedding_dimension(
                 actual_model, actual_url, api_to_use
             )
         async with self._lock:
