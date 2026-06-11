@@ -106,7 +106,7 @@ services:
     container_name: promtail
     volumes:
       - /var/lib/docker/containers:/var/lib/docker/containers:ro
-      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./promtail/promtail-config.yml:/etc/promtail/config.yml:ro
       - promtail_positions:/var/lib/promtail
     command: -config.file=/etc/promtail/config.yml

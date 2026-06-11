@@ -50,7 +50,7 @@ class KBSettings(BaseSettings):
 
     default_embedder_url: str = "https://api.openai.com/v1"
     default_embedder_model: str = "text-embedding-3-small"
-    default_embedder_dim: int = 1536  # Фикс: избегает ValidationError(size=0)
+    default_embedder_dim: int = 1536
     default_api_key: Optional[str] = None
 
     jwt_secret: str
@@ -71,6 +71,8 @@ class KBSettings(BaseSettings):
     calibration_default_min: float = 0.0
     calibration_default_max: float = 1.0
     calibration_min_delta:   float = 1e-6
+    new_calibration_threshold: int = 50
+    recalibration_window:      int = 500
 
     log_level: str = "INFO"
     uvicorn_timeout_keep_alive: int = 600
@@ -94,11 +96,13 @@ class ContextLogFilter(logging.Filter):
         record.request_id = request_id_var.get()
         record.tenant_id = tenant_id_var.get()
         record.endpoint = endpoint_var.get()
+        # JSON-экранируем сообщение, чтобы оно было валидным внутри JSON-лога
+        record.message_json = json.dumps(record.getMessage(), ensure_ascii=False)
         return True
 
 logging.basicConfig(
     level=os.getenv("KBS_LOG_LEVEL", "INFO").upper(),
-    format='{"timestamp": "%(asctime)s", "level": "%(levelname)s", "service": "kbs", "request_id": "%(request_id)s", "tenant_id": "%(tenant_id)s", "endpoint": "%(endpoint)s", "msg": "%(message)s"}'
+    format='{"timestamp": "%(asctime)s", "level": "%(levelname)s", "service": "kbs", "request_id": "%(request_id)s", "tenant_id": "%(tenant_id)s", "endpoint": "%(endpoint)s", "msg": %(message_json)s}'
 )
 for handler in logging.root.handlers:
     handler.addFilter(ContextLogFilter())
@@ -230,7 +234,7 @@ class KBSService:
         self._models_collection = settings.models_collection_name
 
         # In-memory трекинг для rolling-калибровки
-        self._score_windows: Dict[str, deque[float]] = defaultdict(lambda: deque(maxlen=500))
+        self._score_windows: Dict[str, deque[float]] = defaultdict(lambda: deque(maxlen=settings.recalibration_window))
         self._baselines: Dict[str, np.ndarray] = {}       # Кэш гистограммы
         self._calib_cache: Dict[str, dict] = {}           # Кэш c_min, c_max, version
         self._bucket_edges = np.linspace(0.0, 1.0, 51)    # 50 бинов
@@ -356,8 +360,9 @@ class KBSService:
         for b, c in zip(baseline, current):
             pct_b = b / s_base
             pct_c = c / s_curr
-            psi += (pct_c - pct_b) * math.log(pct_c / pct_b + 1e-6)
-        return psi
+            if pct_b != 0 or pct_c != 0:
+                psi += (pct_c - pct_b) * math.log((pct_c + 1e-6) / (pct_b + 1e-6))
+        return  psi
 
 
     def _record_drift_metrics(self, model_key: str, curr_hist: np.ndarray, base_hist: np.ndarray, window: deque):
@@ -374,7 +379,7 @@ class KBSService:
 
             # Делаем snapshot окна и выходим, если не набрали 500 скоров
             window = list(self._score_windows[model_key])
-            if len(window) < 500: return
+            if len(window) < self.settings.recalibration_window: return
 
         # 1. Загружаем текущее состояние из Qdrant (или None, если холодный старт)
         state = await self._scroll_model(model_key) or {}
@@ -470,7 +475,7 @@ class KBSService:
     async def _auto_calibrate_if_new(self, model_key: str, vectors: List[List[float]]):
         """Первичная калибровка модели"""
         state = await self._scroll_model(model_key, with_payload=False)
-        if state or len(vectors) < 50:  return
+        if state or len(vectors) < self.settings.new_calibration_threshold:  return
 
         def _compute():
             subset = np.array(random.sample(vectors, min(len(vectors), 100)), dtype=np.float32)
@@ -769,16 +774,17 @@ class KBSService:
             total_tokens += t; total_cost += c
 
             # Ищем релевантные чанки в БЗ (количество чанков берем с запасом)
-            hits = await self.backend.search(collection_name=cfg["collection_name"], 
-                query_vector=vec[0], limit=req.k * len(kb_configs),
+            hits = await self.backend.query_points(collection_name=cfg["collection_name"], 
+                query=vec[0], limit=req.k * len(kb_configs),
                 query_filter=models.Filter(must=[
                     models.FieldCondition(key="tenant_id", match=models.MatchValue(value=tenant_id)),
                     models.FieldCondition(key="base_id", match=models.MatchValue(value=cfg["base_id"]))
-                ]), with_payload=["text", "doc_id"], with_vectors=False)
+                ]), with_payload=["text", "doc_id", "chunk_index"], with_vectors=False)
+            logger.debug(f"✅ Retrieved points: {hits}")
             
             # Фильтруем извлеченные чанки по relevance_threshold и добавляем их в all_results
             raw_scores, scores, docs_map = [], [], cfg.get("documents", {})
-            for h in hits:
+            for h in hits.points:
                 raw_scores.append(h.score)
                 calibrated = self._apply_calibration(h.score, cal_params, model_key)
                 scores.append(calibrated)

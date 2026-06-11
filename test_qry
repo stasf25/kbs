@@ -1,0 +1,11 @@
+curl -X POST http://localhost:8000/api/v1/kb/query \
+  -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ0ZXN0LXVzZXIiLCJ0ZW5hbnRfaWQiOiJ0ZW5hbnQtYWJjLTEyMyIsInRlbmFudF9xdW90YV9rYiI6MTYzODQsImV4cCI6MTgxMjQ1MDEzMn0.SCdeXpyMSvcTzXVtR3swvrQnKiZ0aeM5SoE0zHKn_vA" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "question": "concurency problem",
+    "relevance_threshold": 0,
+    "k": 20,
+    "base_id": "test-kb-001"
+  }'
+
+#    "text": "Искусственный интеллект трансформирует бизнес. Он помогает автоматизировать рутину, анализировать данные и принимать решения. Внедрение AI требует чёткой стратегии и качественных данных.",
