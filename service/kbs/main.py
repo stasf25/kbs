@@ -230,7 +230,7 @@ class KBSService:
         self._models_collection = settings.models_collection_name
 
         # In-memory трекинг для rolling-калибровки
-        self._score_windows: Dict[str, deque] = defaultdict(lambda: deque(maxlen=500))
+        self._score_windows: Dict[str, deque[float]] = defaultdict(lambda: deque(maxlen=500))
         self._baselines: Dict[str, np.ndarray] = {}       # Кэш гистограммы
         self._calib_cache: Dict[str, dict] = {}           # Кэш c_min, c_max, version
         self._bucket_edges = np.linspace(0.0, 1.0, 51)    # 50 бинов
@@ -258,7 +258,7 @@ class KBSService:
                 ]),
                 limit=1, with_payload=with_payload, with_vectors=False
             )
-            return pts if not with_payload else pts[0].payload if pts else None
+            return pts if not with_payload else {"id": str(pts[0].id), **pts[0].payload} if pts else None
         except Exception as e:
             logger.error(f"❌ Error in {self._models_collection} scroll by {model_key}: {e}", exc_info=True)
             return None
@@ -280,11 +280,12 @@ class KBSService:
             raise HTTPException(401, detail=f"Invalid token: {e}")
 
     async def _fetch_kb_meta(self, tenant_id: str, base_ids: List[str]) -> Dict[str, Dict]:
+        ids = [id.split(':')[-1].strip() for id in base_ids]
         points, _ = await self.backend.scroll(
             collection_name=self._meta_collection,
             scroll_filter=models.Filter(must=[
                 models.FieldCondition(key="tenant_id", match=models.MatchValue(value=tenant_id)),
-                models.FieldCondition(key="base_id", match=models.MatchAny(any=base_ids))
+                models.FieldCondition(key="base_id", match=models.MatchAny(any=ids))
             ]),
             limit=len(base_ids), with_payload=True, with_vectors=False
         )
@@ -419,16 +420,20 @@ class KBSService:
                 #window.clear()
                 return
 
-            await self.backend.set_payload(
+            await self.backend.upsert(
                 collection_name=self._models_collection,
-                payload={
-                    "c_min": new_c_min, "c_max": new_c_max,
-                    "baseline_hist": merged_hist.tolist(),
-                    "calib_version": version + 1,
-                    "total_scores": latest.get("total_scores", 0) + len(window),
-                    "updated_at": time.time()
-                },
-                points=[model_key]
+                points=[models.PointStruct(
+                    id=latest.get('id', str(uuid.uuid4())), 
+                    vector=[0.0],
+                    payload={
+                        "model_name": model_key,
+                        "c_min": new_c_min, "c_max": new_c_max,
+                        "calib_version": version + 1, 
+                        "total_scores": latest.get("total_scores", 0) + len(window),
+                        "baseline_hist": merged_hist.tolist(),
+                        "updated_at": time.time()
+                    }
+                )]
             )
 
             # 6. Обновляем in-memory кэш и логи
@@ -480,21 +485,26 @@ class KBSService:
 
         c_min, c_max, baseline = await asyncio.to_thread(_compute)
         
-        await self.backend.upsert(
-            collection_name=self._models_collection,
-            points=[models.PointStruct(
-                id=model_key, vector=[0.0],
-                payload={
-                    "model_name": model_key,
-                    "c_min": c_min, "c_max": c_max,
-                    "calib_version": 1, "total_scores": 0,
-                    "baseline_hist": baseline.tolist(),
-                    "fitted_at": time.time(), "method": "batch_pairwise_percentiles"
-                }
-            )]
-        )
-        self._calib_cache[model_key] = {"c_min": c_min, "c_max": c_max, "calib_version": 1}
-        self._baselines[model_key] = baseline
+        async with self._lock:
+            if  self._scroll_model(model_key, with_payload=False):
+                logger.debug(f"⏭️ Calibration race for {model_key}, skipping initial calibration...")
+                return
+            await self.backend.upsert(
+                collection_name=self._models_collection,
+                points=[models.PointStruct(
+                    id=str(uuid.uuid4()), 
+                    vector=[0.0],
+                    payload={
+                        "model_name": model_key,
+                        "c_min": c_min, "c_max": c_max,
+                        "calib_version": 1, "total_scores": 0,
+                        "baseline_hist": baseline.tolist(),
+                        "updated_at": time.time()
+                    }
+                )]
+            )
+            self._calib_cache[model_key] = {"c_min": c_min, "c_max": c_max, "calib_version": 1}
+            self._baselines[model_key] = baseline
         logger.info(f"🆕 Initial calibration for {model_key}: [{c_min}, {c_max}]")
 
     async def _parse_and_chunk(self, req: EmbedRequest) -> tuple[List[Dict[str, Any]], Dict[str, str]]:
@@ -533,6 +543,45 @@ class KBSService:
             return False
 
 
+    async def _create_collection(self, collection_name: str, actual_dim: int) -> None:
+        try:
+            await self.backend.create_collection(
+                collection_name=collection_name,
+                vectors_config=models.VectorParams(
+                    size=actual_dim, distance=models.Distance.COSINE
+                ),
+                hnsw_config=models.HnswConfigDiff(payload_m=16,m=0)
+            )
+        except Exception as e:
+            if "already exists" not in str(e).lower():
+                logger.error(msg:=f"Collection `{collection_name}` init failed: {e}", exc_info=True)
+                raise HTTPException(500, detail=msg)
+        try:
+            await self.backend.create_payload_index(
+                collection_name=collection_name,
+                field_name="tenant_id",
+                field_schema=models.KeywordIndexParams(
+                    type=models.KeywordIndexType.KEYWORD,
+                    is_tenant=True,
+            ))
+        except Exception as e:
+            if "already exists" not in str(e).lower():
+                logger.error(msg:=f"Index init by tenant_id for `{collection_name}` failed: {e}", exc_info=True)
+                raise HTTPException(500, detail=msg)
+        try:
+            await self.backend.create_payload_index(
+                collection_name=collection_name,
+                field_name="base_id",
+                field_schema=models.KeywordIndexParams(
+                    type=models.KeywordIndexType.KEYWORD,
+            ))
+        except Exception as e:
+            if "already exists" not in str(e).lower():
+                logger.error(msg:=f"Index init by base_id for `{collection_name}` failed: {e}", exc_info=True)
+                raise HTTPException(500, detail=msg)
+        logger.info(f"🆕 Created collection `{collection_name}`")
+
+
     async def health(self) -> HealthResponse:
         try:
             await self.backend.get_collections()
@@ -544,7 +593,11 @@ class KBSService:
     async def embed(self, req: EmbedRequest, tenant_ctx: dict, api_key: Optional[str], bg: BackgroundTasks) -> EmbedResponse:
         start = time.time()
         tenant_id, quota_kb = tenant_ctx["tenant_id"], tenant_ctx["quota_kb"]
-        base_id = req.base_id or str(uuid.uuid4())
+        base_id = req.base_id.split(':')[-1].strip() or str(uuid.uuid4())
+        filter  = models.Filter(must=[
+            models.FieldCondition(key="base_id", match=models.MatchValue(value=base_id)),
+            models.FieldCondition(key="tenant_id", match=models.MatchValue(value=tenant_id))
+        ])
 
         # Конфигурация эмбеддера
         is_default = req.embedder_type == "platform" or not req.embedder_url
@@ -559,10 +612,7 @@ class KBSService:
         if req.base_id:
             old_pts, _ = await self.backend.scroll(
                 collection_name=self._meta_collection,
-                scroll_filter=models.Filter(must=[
-                    models.FieldCondition(key="base_id", match=models.MatchValue(value=req.base_id)),
-                    models.FieldCondition(key="tenant_id", match=models.MatchValue(value=tenant_id))
-                ]),
+                scroll_filter=filter,
                 limit=1, with_payload=["collection_name"], with_vectors=False
             )
             if old_pts:
@@ -570,7 +620,7 @@ class KBSService:
                 await self._delete_base_points(old_coll, tenant_id, req.base_id)
                 await self.backend.delete(  # Удаляем старый конфиг из метаданных (осв. квоту!)
                     collection_name=self._meta_collection,
-                    points_selector=models.PointIdsList(points=[req.base_id])
+                    points_selector=models.PointIdsList(points=[old_pts[0].id])
                 )
                 logger.info(f"♻️ Overwrite cleanup completed for base_id={req.base_id}")
             else:
@@ -589,7 +639,8 @@ class KBSService:
                 models.FieldCondition(key="type", match=models.MatchValue(value="kb_config")),
                 models.FieldCondition(key="tenant_id", match=models.MatchValue(value=tenant_id))
             ]),
-            limit=10000, with_payload=["size_kb"], with_vectors=False
+            #limit=10000, 
+            with_payload=["size_kb"], with_vectors=False
         )
         current_used_kb = sum(p.payload.get("size_kb", 0.0) for p in points)
         remaining_kb = quota_kb - current_used_kb
@@ -634,32 +685,14 @@ class KBSService:
             actual_dim = await self._detect_embedding_dimension(
                 actual_model, actual_url, api_to_use
             )
-        if not await self._collection_exists(collection_name):
-            try:
-                await self.backend.create_collection(
-                    collection_name=collection_name,
-                    vectors_config=models.VectorParams(
-                        size=actual_dim, distance=models.Distance.COSINE
-                    )
-                )
-                await self.backend.create_payload_index(
-                    collection_name=collection_name,
-                    field_name="tenant_id",
-                    field_schema={"type": "keyword", "is_tenant": True}
-                )
-                await self.backend.create_payload_index(
-                    collection_name=collection_name,
-                    field_name="base_id",
-                    field_schema="keyword"
-                )
-                logger.info(f"🆕 Created collection {collection_name}")
-            except Exception as e:
-                if "already exists" not in str(e).lower():
-                    raise HTTPException(500, detail=f"Collection init failed: {e}")
+        async with self._lock:
+            if not await self._collection_exists(collection_name):
+                await self._create_collection(collection_name, actual_dim)
 
         # 7. Write-ahead конфига БЗ в метаданные
         await self.backend.upsert(collection_name=self._meta_collection, points=[models.PointStruct(
-            id=base_id, vector=[0.0], payload={
+            id=str(uuid.uuid4()), 
+            vector=[0.0], payload={
                 "type": "kb_config", "tenant_id": tenant_id, "base_id": base_id,
                 "collection_name": collection_name, "documents": documents_map,
                 "embedding_config": {
@@ -674,7 +707,8 @@ class KBSService:
         # 8. Загрузка векторов в Qdrant
         points_to_upsert = [
             models.PointStruct(
-                id=c["id"], vector=all_vectors[i],
+                id=str(uuid.uuid4()), 
+                vector=all_vectors[i],
                 payload={
                     "tenant_id": tenant_id, "base_id": base_id, "text": c["text"],
                     "doc_id": c["doc_id"], "chunk_index": c["chunk_index"], "created_at": c["created_at"]
@@ -692,7 +726,7 @@ class KBSService:
         await self.backend.set_payload(
             collection_name=self._meta_collection,
             payload={"updated_at": time.time()},
-            points=[base_id]
+            points=filter
         )
         logger.info(f"✅ Metadata finalized for base_id={base_id}")
 
@@ -753,8 +787,9 @@ class KBSService:
                     base_id=f"emb_db:{cfg['base_id']}", 
                     id=str(h.id), page_content=h.payload.get("text", ""),
                     metadata=ChunkMetadata(
-                        doc_id=h.payload.get("doc_id", ""), 
-                        source=docs_map.get(h.payload.get("doc_id"), "unknown")
+                        doc_id= h.payload.get('doc_id', ""), 
+                        source= docs_map.get(h.payload.get('doc_id'), "unknown") + 
+                                f": chunk {h.payload.get('chunk_index', 0)}"
                     ),
                     relevance=round(calibrated, 4), raw_score=round(h.score, 4)
                 ))
@@ -771,18 +806,25 @@ class KBSService:
 
 
     async def remove(self, req: RemoveRequest, tenant_ctx: dict) -> Dict[str, str]:
-        tenant_id = tenant_ctx["tenant_id"]
-        cfg = (await self._fetch_kb_meta(tenant_id, [req.base_id]))[req.base_id]
+        tenant_id = tenant_ctx['tenant_id']
+        kb_configs = await self._fetch_kb_meta(tenant_id, [req.base_id])
         
         # Удаляем точки БЗ и ее конфиг из мета-коллекции
-        await self._delete_base_points(cfg["collection_name"], tenant_id, req.base_id)
-        await self.backend.delete(
-            collection_name=self._meta_collection, 
-            points_selector=models.PointIdsList(points=[req.base_id])
-        )
+        for cfg in kb_configs.values():
+            await self._delete_base_points(cfg['collection_name'], tenant_id, cfg['base_id'])
+            await self.backend.delete(
+                collection_name=self._meta_collection, 
+                points_selector=models.Filter(must=[
+                    models.FieldCondition(key="base_id", match=models.MatchValue(value=cfg['base_id'])),
+                    models.FieldCondition(key="tenant_id", match=models.MatchValue(value=tenant_id))
+                ])
+            )
+            logger.info(f"🗑 Successfully removed base_id={cfg['base_id']} for tenant {tenant_id}")
         
-        REQ_COUNTER.labels(endpoint="/remove", status="success").inc()
-        logger.info(f"🗑 Successfully removed base_id={req.base_id} for tenant {tenant_id}")
+        if  kb_configs:
+            REQ_COUNTER.labels(endpoint="/remove", status="success").inc()
+        else:
+            logger.warning(f"⚠️ Not found base_id={req.base_id} for tenant {tenant_id}")
         return {"status": "success"}
 
 
@@ -801,7 +843,7 @@ async def lifespan(app: FastAPI):
         url=settings.qdrant_url, api_key=settings.qdrant_api_key, prefer_grpc=True
     )
     meta_cfg = models.HnswConfigDiff(
-        m=1, payload_m=16, on_disk=True, full_scan_threshold=1
+        m=0, payload_m=16, on_disk=True, full_scan_threshold=1
     )
     for name in [settings.meta_collection_name, settings.models_collection_name]:
         try:
@@ -813,14 +855,23 @@ async def lifespan(app: FastAPI):
             if name == settings.meta_collection_name:
                 await backend.create_payload_index(
                     collection_name=name, field_name="tenant_id", 
-                    field_schema={"type": "keyword", "is_tenant": True}
+                    field_schema=models.KeywordIndexParams(
+                        type=models.KeywordIndexType.KEYWORD,
+                        is_tenant=True,
+                    )
                 )
                 await backend.create_payload_index(
-                    collection_name=name, field_name="base_id", field_schema="keyword"
+                    collection_name=name, field_name="base_id",
+                    field_schema=models.KeywordIndexParams(
+                        type=models.KeywordIndexType.KEYWORD,
+                    )
                 )
             elif name == settings.models_collection_name:
                 await backend.create_payload_index(
-                    collection_name=name, field_name="model_name", field_schema="keyword"
+                    collection_name=name, field_name="model_name",
+                    field_schema=models.KeywordIndexParams(
+                        type=models.KeywordIndexType.KEYWORD,
+                    )
                 )
         except Exception as e:
             logger.warning(f"{name} init warning: {e}")

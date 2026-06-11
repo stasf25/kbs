@@ -1,12 +1,17 @@
 log_level: INFO
+
 telemetry:
   disabled: false
   telemetry_reporting:
     disabled: false
+
 service:
   enable_tls: false
   http_port: 6333
   grpc_port: 6334
+  # Поддержка мультитенантности
+  enable_tenant_index: true
+
 storage:
   # Оптимизация под SSD/NVMe
   performance:

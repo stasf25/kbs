@@ -84,7 +84,7 @@
       "options": { "legend": { "calcs": ["mean", "last"], "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
         { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "kbs_score_mean{model_key=~\"$model_key\"}", "legendFormat": "{{model_key}} mean", "refId": "A" },
-        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "kbs_score_out_of_range_ratio{model_key=~\"$model_key\"}", "hide": false, "legendFormat": "{{model_key}} OOR ratio", "refId": "B" }
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(rate(kbs_calibration_out_of_range_total{model_key=~\"$model_key\"}[5m])) by (model_key) / sum(rate(kbs_score_distribution_count{model_key=~\"$model_key\"}[5m])) by (model_key) or vector(0)", "hide": false, "legendFormat": "{{model_key}} OOR ratio", "refId": "B" }
       ],
       "title": "Score Mean & Out-of-Range Ratio", "type": "timeseries",
       "dataLinks": [
