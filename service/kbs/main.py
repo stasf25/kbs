@@ -28,8 +28,8 @@ from qdrant_client import AsyncQdrantClient, models
 from openai import AsyncOpenAI
 from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
-from langchain_kreuzberg import KreuzbergLoader
-from kreuzberg import ExtractionConfig
+#from langchain_kreuzberg import KreuzbergLoader
+from kreuzberg import ExtractionConfig, extract_bytes
 from prometheus_client import Histogram, Counter, Gauge, REGISTRY, generate_latest, CONTENT_TYPE_LATEST
 from fastapi.responses import Response
 from starlette.requests import Request
@@ -512,31 +512,46 @@ class KBSService:
             self._baselines[model_key] = baseline
         logger.info(f"🆕 Initial calibration for {model_key}: [{c_min}, {c_max}]")
 
-    async def _parse_and_chunk(self, req: EmbedRequest) -> tuple[List[Dict[str, Any]], Dict[str, str]]:
-        def _sync_process() -> tuple[List[Dict[str, Any]], Dict[str, str]]:
-            all_chunks, documents_map = [], {}
-            config = ExtractionConfig(output_format="markdown")
-            sources = []
-            if req.text: sources.append(("direct_input", req.record_id or f"text_{uuid.uuid4().hex[:8]}"))
-            if req.url: sources.append((req.url, req.record_id or f"url_{uuid.uuid4().hex[:8]}"))
-            if req.files_urls: sources.extend((u, req.record_id or f"file_{i}") for i, u in enumerate(req.files_urls))
 
-            for src, doc_id in sources:
-                try:
-                    if src == "direct_input":
-                        md_text = req.text.strip()
-                        documents_map[doc_id] = "direct_input"
-                    else:
-                        loader = KreuzbergLoader(source=src, config=config)
-                        docs = loader.load()
-                        md_text = "\n\n".join(d.page_content for d in docs if d.page_content.strip())
-                        documents_map[doc_id] = src
-                    if md_text:
-                        all_chunks.extend(cascade_chunk_markdown(md_text, doc_id, req.chunk_size, req.chunk_overlap, req.separator))
-                except Exception as e:
-                    logger.warning(f"Parse failed for {src}: {e}")
-            return all_chunks, documents_map
-        return await asyncio.to_thread(_sync_process)
+    async def _extract_markdown_from_url(self, url: str) -> str:
+        """Скачивает файл по URL и возвращает извлеченный текст в Markdown."""
+
+        # Скачиваем файл
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            mime_type = response.headers.get("content-type", "application/octet-stream")
+        logger.info(f"Read {len(response.content)} bytes of {mime_type} from {url}")
+        
+        # Извлекаем текст в формате Markdown
+        config = ExtractionConfig(output_format="markdown")
+        result = await extract_bytes(data=response.content, mime_type=mime_type, config=config)
+        return result.content
+
+
+    async def _parse_and_chunk(self, req: EmbedRequest) -> tuple[List[Dict[str, Any]], Dict[str, str]]:
+        all_chunks, sources, documents_map = [], [], {}
+
+        # Формируем список источников с их id
+        if req.text: sources.append(("direct_input", f"txt:{uuid.uuid4().hex}"))
+        if req.url: sources.append((req.url, f"url:{uuid.uuid4().hex}"))
+        if req.files_urls: sources.extend((u, f"fil:{uuid.uuid4().hex}") for u in req.files_urls)
+
+        for src, doc_id in sources:
+            try:
+                if src == "direct_input": md_text = req.text.strip()
+                else:                     md_text = await self._extract_markdown_from_url(src)
+                logger.info(f"Extracted len: {len(md_text)} from {src}: {md_text[:16]}...")
+                if md_text:
+                    all_chunks.extend(cascade_chunk_markdown(
+                        md_text, doc_id, req.chunk_size, req.chunk_overlap, req.separator
+                    ))
+                    documents_map[doc_id] = src
+                else:
+                    logger.warning(f"No text extracted from {src}")
+            except Exception as e:
+                logger.warning(f"Parse failed for {src}: {e}")
+        return all_chunks, documents_map
 
 
     async def _collection_exists(self, collection_name: str) -> bool:
