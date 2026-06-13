@@ -196,31 +196,30 @@ def cascade_chunk_markdown(
     separator: str = "--- BLOCK START ---"
 ) -> List[Dict[str, Any]]:
     md_splitter = MarkdownHeaderTextSplitter(
-        headers_to_split_on=[("#", "H1"), ("##", "H2"), ("###", "H3"), ("####", "H4")],
+        headers_to_split_on=[("#", "H1"), ("##", "H2"), ("###", "H3")],
         strip_headers=True
     )
-    header_docs = md_splitter.split_text(markdown_text)
-    enriched = []
-    for doc in header_docs:
-        headers = [doc.metadata.get(h) for h in ["H1", "H2", "H3", "H4"] if doc.metadata.get(h)]
-        prefix = " > ".join(headers) + "\n" if headers else ""
-        content = f"{prefix}{doc.page_content.strip()}"
-        if content.strip():
-            enriched.append(Document(page_content=content, metadata={"doc_id": doc_id}))
-
-    rec_splitter = RecursiveCharacterTextSplitter(
+    txt_splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
         length_function=len,
-        separators=[separator, "\n\n", "\n", ". ", " ", "。"],
+        separators=[separator, "####", "\n\n", ". ", ".\n", "; ", ";\n", "\n", " ", ""],
         keep_separator="end"
     )
-    final_chunks = rec_splitter.split_documents(enriched)
+
+    final_chunks = []
+    for md_chunk in md_splitter.split_text(markdown_text):
+        md_heads = " > ".join(v for v in md_chunk.metadata.values() if v).upper()
+
+        for txt_chunk in txt_splitter.split_text(md_chunk.page_content):
+            if not (chunk:= txt_chunk.strip()):  continue
+            if md_heads: chunk = f"[{md_heads}]\n{chunk}"
+            final_chunks.append(chunk)
 
     return [
-        {"id": f"{doc_id}#chunk_{i}", "text": chunk.page_content, "doc_id": doc_id,
+        {"id": f"{doc_id}#chunk_{i}", "text": chunk, "doc_id": doc_id,
          "chunk_index": i, "created_at": time.time()}
-        for i, chunk in enumerate(final_chunks) if chunk.page_content.strip()
+        for i, chunk in enumerate(final_chunks)
     ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -372,12 +371,13 @@ class KBSService:
         
 
     async def _update_score_stats(self, model_key: str, raw_scores: List[float]):
-        """Rolling-калибровка + baseline + PSI (работает даже при cold-start <50)"""
+        """Rolling-калибровка + baseline + PSI (работает даже при cold-start)"""
+        if self.settings.recalibration_window < 100: return  # Защита от неверной настройки
         async with self._lock:
             # Преобразуем raw_scores в relevance и отписываем в скользящее окно
             self._score_windows[model_key].extend((np.array(raw_scores, dtype=np.float32) + 1)/2)
 
-            # Делаем snapshot окна и выходим, если не набрали 500 скоров
+            # Делаем snapshot окна и выходим, если не набрали нужное количество скоров
             window = list(self._score_windows[model_key])
             if len(window) < self.settings.recalibration_window: return
 
@@ -391,7 +391,7 @@ class KBSService:
         # 2. Если baseline ещё нет, создаём его из текущего окна, иначе сливаем гистограммы
         wind_hist, _ = np.histogram(list(window), bins=self._bucket_edges, density=False)
         if baseline_hist.size == 0:
-            baseline_hist = merged_hist = wind_hist
+            baseline_hist = merged_hist = wind_hist = wind_hist.astype(np.float32)
             logger.info(f"📊 Created initial baseline for {model_key} from first {len(window)} scores")
         else:
             merged_hist = (baseline_hist + wind_hist).astype(np.float32)
@@ -399,13 +399,14 @@ class KBSService:
         # Отписываем метрики дрифта статистик relevance
         self._record_drift_metrics(model_key, wind_hist, baseline_hist, window)
         
-        # 3. Считаем новые границы калибровочного диапазона по 2- и 98-персентилям
-        cdf = np.cumsum(merged_hist)
-        total = cdf[-1]
-        idx_min = np.clip(np.searchsorted(cdf, total * 0.02), 0, len(self._bucket_edges)-1)
-        idx_max = np.clip(np.searchsorted(cdf, total * 0.98), 0, len(self._bucket_edges)-1)
-        new_c_min = round(self._bucket_edges[idx_min], 4)
-        new_c_max = round(self._bucket_edges[idx_max], 4)
+        # 3. Считаем новые границы калибровочного диапазона
+        #cdf = np.cumsum(merged_hist)
+        #total = cdf[-1]
+        #idx_min = np.clip(np.searchsorted(cdf, total * 0.02), 0, len(self._bucket_edges)-1)
+        #idx_max = np.clip(np.searchsorted(cdf, total * 0.98), 0, len(self._bucket_edges)-1)
+        #new_c_min = round(self._bucket_edges[idx_min], 4)
+        #new_c_max = round(self._bucket_edges[idx_max], 4)
+        new_c_min,new_c_max = 0.0, round(max(old_c_max, min(1.0, max(window) *1.02)), 2)
 
         # 4. Не обновляем калибровку если границы не сместились
         if abs(new_c_min - old_c_min) < 0.02 and abs(new_c_max - old_c_max) < 0.02:
@@ -475,23 +476,22 @@ class KBSService:
     async def _auto_calibrate_if_new(self, model_key: str, vectors: List[List[float]]):
         """Первичная калибровка модели"""
         state = await self._scroll_model(model_key, with_payload=False)
-        if state or len(vectors) < self.settings.new_calibration_threshold:  return
+        thres = self.settings.new_calibration_threshold
+        if  not thres or state or len(vectors) < thres:  return
 
-        def _compute():
-            subset = np.array(random.sample(vectors, min(len(vectors), 100)), dtype=np.float32)
-            norms  = np.linalg.norm(subset, axis=1, keepdims=True)
-            norms[norms<1e-9] = 1e-9
-            normed = subset / norms
-            ij = np.triu_indices(len(normed), k=1)
-            sims = ((normed @ normed.T)[ij] +1) /2
-            c_min, c_max = np.percentile(sims, 2), np.percentile(sims, 98)
-            hist, _ = np.histogram(sims, bins=self._bucket_edges, density=False)
-            return round(c_min, 4), round(c_max, 4), hist.astype(np.float32)
-
-        c_min, c_max, baseline = await asyncio.to_thread(_compute)
+        # Считаем попарные relevance эмбеддингов для определения статистических границ
+        subset = np.array(random.sample(vectors, min(len(vectors), 100)), dtype=np.float32)
+        norms  = np.linalg.norm(subset, axis=1, keepdims=True)
+        norms[norms<1e-9] = 1e-9
+        normed = subset / norms
+        ij = np.triu_indices(len(normed), k=1)   # Верхний треугольник матрицы косинусного
+        sims = ((normed @ normed.T)[ij] +1) /2   # сходства, приведенный к relevance
+        #c_min,c_max = round(np.percentile(sims, 2), 4), round(np.percentile(sims, 98), 4)
+        c_min,c_max = 0.0, round(min(1.0, sims.max() *1.02), 2)
+        baseline = np.histogram(sims, bins=self._bucket_edges, density=False)[0].astype(np.float32)
         
         async with self._lock:
-            if  self._scroll_model(model_key, with_payload=False):
+            if  await self._scroll_model(model_key, with_payload=False):
                 logger.debug(f"⏭️ Calibration race for {model_key}, skipping initial calibration...")
                 return
             await self.backend.upsert(
@@ -541,7 +541,7 @@ class KBSService:
             try:
                 if src == "direct_input": md_text = req.text.strip()
                 else:                     md_text = await self._extract_markdown_from_url(src)
-                logger.info(f"Extracted len: {len(md_text)} from {src}: {md_text[:16]}...")
+                logger.info(f"Extracted len={len(md_text)} from {src}: {md_text[:16]}...")
                 if md_text:
                     all_chunks.extend(cascade_chunk_markdown(
                         md_text, doc_id, req.chunk_size, req.chunk_overlap, req.separator
@@ -605,8 +605,10 @@ class KBSService:
     async def health(self) -> HealthResponse:
         try:
             await self.backend.get_collections()
+            logger.info("healthcheck_ok")
             return HealthResponse(status="ok")
-        except Exception:
+        except Exception as e:
+            logger.error(f"healthcheck_failed (qdrant error): {e}")
             return HealthResponse(status="degraded")
 
 
