@@ -11,5 +11,8 @@ scrape_configs:
 
   - job_name: 'qdrant'
     metrics_path: '/metrics'
+    http_headers:
+      api-key:
+        values: ['__QDRANT_API_KEY__']
     static_configs:
       - targets: ['qdrant:6333']
