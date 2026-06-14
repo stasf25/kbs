@@ -16,7 +16,7 @@ import math
 import random
 import contextvars
 import numpy as np
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, AsyncGenerator
 from contextlib import asynccontextmanager
 from collections import defaultdict, deque
 from pathlib import Path
@@ -276,7 +276,6 @@ class KBSService:
             )
             tenant_id = payload.get("tenant_id") or payload.get("sub")
             if not tenant_id: raise ValueError("tenant_id claim missing")
-            tenant_id_var.set(tenant_id)
             quota_kb = int(payload.get("tenant_quota_kb", self.settings.default_quota_kb))
             return {"tenant_id": tenant_id, "quota_kb": quota_kb}
         except (jwt.PyJWTError, ValueError, TypeError) as e:
@@ -754,7 +753,6 @@ class KBSService:
 
         # 10. Метрики и ответ
         EMBED_LATENCY.observe(time.time() - start)
-        REQ_COUNTER.labels(endpoint="/embed", status="success").inc()
         return EmbedResponse(
             base_id=f"emb_db:{base_id}", chunks=len(chunks), tokens=total_tokens, cost_usd=total_cost
         )
@@ -824,7 +822,6 @@ class KBSService:
         # Сортируем все извлеченные чанки по релевантности и формируем ответ
         all_results.sort(key=lambda x: x.relevance, reverse=True)
         QUERY_LATENCY.labels(model_key="; ".join(model_keys_seen)).observe(time.time() - start)
-        REQ_COUNTER.labels(endpoint="/query", status="success").inc()
         return QueryResponse(results=all_results[:req.k], tokens=total_tokens, cost_usd=total_cost)
 
 
@@ -844,9 +841,7 @@ class KBSService:
             )
             logger.info(f"🗑 Successfully removed base_id={cfg['base_id']} for tenant {tenant_id}")
         
-        if  kb_configs:
-            REQ_COUNTER.labels(endpoint="/remove", status="success").inc()
-        else:
+        if  not kb_configs:
             logger.warning(f"⚠️ Not found base_id={req.base_id} for tenant {tenant_id}")
         return {"status": "success"}
 
@@ -910,16 +905,37 @@ app = FastAPI(title="Knowledge Base Service", version="1.0.0", lifespan=lifespan
 app.state.settings = KBSettings.from_env()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 🧠 Middleware для сквозного логирования (ТЗ 7.3)
+# 🧠 Middleware для сквозного логирования и метрик (ТЗ 7.3 + Observability)
 # ─────────────────────────────────────────────────────────────────────────────
 @app.middleware("http")
 async def request_context_middleware(request: Request, call_next):
+    # 1. Идентификатор запроса
     req_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
-    request_id_var.set(req_id)
-    endpoint_var.set(f"{request.method} {request.url.path}")
-    response = await call_next(request)
-    response.headers["X-Request-ID"] = req_id
-    return response
+    req_tkn= request_id_var.set(req_id)
+    
+    # 2. Чистый путь роута для метрик и логов (например, /api/v1/kb/{base_id})
+    # Если роут ещё не сматчился (статика, 404), fallback на raw URL
+    route = request.scope.get("route")
+    endpoint = route.path if route else request.url.path
+    end_tkn  = endpoint_var.set(f"{request.method} {endpoint}")
+    
+    try:
+        # 3. Выполняем запрос
+        response = await call_next(request)
+        
+        # 4. Прокидываем ID в ответ
+        response.headers["X-Request-ID"] = req_id
+        return response
+        
+    finally: # ВЫПОЛНЯЕТСЯ ПОСЛЕ ВЫЧИСЛЕНИЯ ВОЗВРАЩАЕМОГО ЗНАЧЕНИЯ, НО ДО ВОЗВРАТА
+
+        # 5. Инкрементируем Prometheus-счётчик
+        REQ_COUNTER.labels(endpoint=endpoint, status=str(response.status_code)).inc()
+
+        # 6. Освобождаем контекст
+        request_id_var.reset(req_tkn)
+        endpoint_var.reset(end_tkn)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 🧠 Middleware для проксирования запросов на legacy endpoint
@@ -969,6 +985,22 @@ async def legacy_proxy_middleware(request: Request, call_next):
     return await call_next(request)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  Обертка для управления жизненным циклом tenant_id_var
+# ─────────────────────────────────────────────────────────────────────────────
+async def tenant_context_manager(
+    authorization: str = Header(..., alias="Authorization"),
+    kbs: KBSService = Depends(get_kbs)
+) -> AsyncGenerator[dict, None]:
+
+    # Устанавливаем tenant_id в контекст
+    ctx   = await kbs._extract_tenant_context(authorization)
+    token = tenant_id_var.set(ctx.get("tenant_id"))
+    try:
+        yield ctx  # Отдаём словарь эндпоинту
+    finally:
+        tenant_id_var.reset(token)  # Сброс гарантирован
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Эндпоинты микросервиса
@@ -979,28 +1011,25 @@ async def health_check(kbs: KBSService = Depends(get_kbs)):
 
 @app.post("/api/v1/kb/embed", response_model=EmbedResponse)
 async def embed_kb(req: EmbedRequest, bg: BackgroundTasks,
-    authorization: str = Header(..., alias="Authorization"),
+    tenant_ctx: dict = Depends(tenant_context_manager),
     x_embed_key: Optional[str] = Header(None, alias="X-Embedding-API-Key"),
     kbs: KBSService = Depends(get_kbs)
 ):
-    tenant_ctx = await kbs._extract_tenant_context(authorization)
     return await kbs.embed(req, tenant_ctx, x_embed_key, bg)
 
 @app.post("/api/v1/kb/query", response_model=QueryResponse)
 async def query_kb(req: QueryRequest,
-    authorization: str = Header(..., alias="Authorization"),
+    tenant_ctx: dict = Depends(tenant_context_manager),
     x_embed_key: Optional[str] = Header(None, alias="X-Embedding-API-Key"),
     kbs: KBSService = Depends(get_kbs)
 ):
-    tenant_ctx = await kbs._extract_tenant_context(authorization)
     return await kbs.query(req, tenant_ctx, x_embed_key)
 
 @app.post("/api/v1/kb/remove")
 async def remove_kb(req: RemoveRequest,
-    authorization: str = Header(..., alias="Authorization"),
+    tenant_ctx: dict = Depends(tenant_context_manager),
     kbs: KBSService = Depends(get_kbs)
 ):
-    tenant_ctx = await kbs._extract_tenant_context(authorization)
     return await kbs.remove(req, tenant_ctx)
 
 @app.get("/metrics")
