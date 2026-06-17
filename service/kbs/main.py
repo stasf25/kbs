@@ -545,7 +545,8 @@ class KBSService:
                     all_chunks.extend(cascade_chunk_markdown(
                         md_text, doc_id, req.chunk_size, req.chunk_overlap, req.separator
                     ))
-                    documents_map[doc_id] = src
+                    documents_map[doc_id] = src if not doc_id.startswith("fil:")  \
+                                                else src.split('/')[-1]  # Берем только имя файла
                 else:
                     logger.warning(f"No text extracted from {src}")
             except Exception as e:
@@ -624,7 +625,6 @@ class KBSService:
         is_default = req.embedder_type == "platform" or not req.embedder_url
         actual_model = self.settings.default_embedder_model if is_default else req.embedder_model
         actual_url = self.settings.default_embedder_url if is_default else req.embedder_url
-        actual_dim = self.settings.default_embedder_dim if is_default else req.embedder_dim
         collection_name = self._get_collection_name(actual_model)
         model_key = self._get_clean_model_key(actual_model)
         api_to_use = api_key or req.openai_api_key
@@ -702,10 +702,9 @@ class KBSService:
         await self._auto_calibrate_if_new(model_key, all_vectors)
 
         # 6. Создание коллекции (если ещё нет)
-        if not actual_dim:
-            actual_dim = len(all_vectors[0]) if all_vectors else await self._detect_embedding_dimension(
-                actual_model, actual_url, api_to_use
-            )
+        actual_dim = len(all_vectors[0]) if all_vectors else await self._detect_embedding_dimension(
+            actual_model, actual_url, api_to_use
+        )
         async with self._lock:
             if not await self._collection_exists(collection_name):
                 await self._create_collection(collection_name, actual_dim)
